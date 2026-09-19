@@ -205,6 +205,146 @@ def test_langsmith_exported_payloads_never_contain_marker_material():
         assert marker not in exported
 
 
+# ---------------------------------------------------------------------------
+# Adversarial negatives: banned material hidden inside an ALLOWED envelope
+# value via Unicode default-ignorable obfuscation. The pre-send gate must
+# normalize-then-match over the actual outbound payload: reject with NO POST,
+# and never echo the value (raw or normalized) in detail. (R4a fix.)
+# ---------------------------------------------------------------------------
+
+
+def _envelope_with_model(value: str) -> dict:
+    """A schema-shaped envelope whose allowed ``model`` field carries the attack."""
+    env = make_envelope()
+    env["model"] = value
+    return env
+
+
+@pytest.mark.parametrize(
+    "obfuscated",
+    [
+        "SEN\u2063TINEL-SECRET-VALUE",  # U+2063 invisible separator (R4a probe)
+        "SENTINEL\u200b-SECRET-VALUE",  # U+200B zero width space
+        "SEN\u2063TINEL\u2063-SECRET\u200b-VALUE",  # doubled / mixed
+        "SEN\U000e0020TINEL-SECRET-VALUE",  # U+E0020 tag character
+    ],
+)
+def test_langsmith_gate_rejects_obfuscated_sentinel_in_envelope_value_without_post(
+    obfuscated,
+):
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    result = exp.deliver([make_event(1, envelope=_envelope_with_model(obfuscated))])
+
+    assert result["ok"] is False
+    assert result["accepted"] == 0
+    assert post.calls == []  # zero network calls: nothing was POSTed
+    # Violations name locations only — neither the raw obfuscated value nor
+    # its normalized (de-obfuscated) form may appear in detail.
+    assert obfuscated not in result["detail"]
+    assert sinks._strip_default_ignorables(obfuscated) not in result["detail"]
+
+
+def test_langsmith_gate_rejects_plain_sentinel_in_envelope_value_without_post():
+    """Not obfuscated at all — the plain marker in an allowed value also fails."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    result = exp.deliver([make_event(1, envelope=_envelope_with_model(MARKERS[3]))])
+
+    assert result["ok"] is False
+    assert result["accepted"] == 0
+    assert post.calls == []
+    assert MARKERS[3] not in result["detail"]
+
+
+def test_langsmith_gate_rejects_secret_shape_in_envelope_value_without_post():
+    """Secret SHAPES (not just markers) are banned too — synthetic fixture key."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    fake = "sk-FAKE-unit-fixture-0123456789"
+    result = exp.deliver([make_event(1, envelope=_envelope_with_model(fake))])
+
+    assert result["ok"] is False
+    assert result["accepted"] == 0
+    assert post.calls == []
+    assert fake not in result["detail"]
+
+
+def test_langsmith_make_run_violation_for_obfuscated_marker():
+    """The gate is enforced at payload construction: make_run refuses."""
+    exp = sinks.LangSmithExporter(api_key="test-key")
+    payload, violation = exp.make_run(
+        make_event(1, envelope=_envelope_with_model("SEN\u2063TINEL-SECRET-VALUE"))
+    )
+    assert payload == {}
+    assert violation is not None
+    assert "SENTINEL-SECRET-VALUE" not in violation
+
+
+def test_langsmith_gate_stops_batch_at_first_leak_attempt():
+    """A leaking event halts the batch: later events are never forwarded."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    leak = make_event(1, envelope=_envelope_with_model("SENTINEL\u2063-PROMPT-TEXT"))
+    result = exp.deliver([leak, make_event(2), make_event(3)])
+
+    assert result["ok"] is False
+    assert result["accepted"] == 0
+    assert len(post.calls) == 0
+    assert "SENTINEL-PROMPT-TEXT" not in result["detail"]
+    assert "SENTINEL\u2063" not in result["detail"]
+
+
+def test_langsmith_gate_strips_ignorables_from_clean_values_before_send():
+    """A benign value carrying an invisible character is not banned material:
+    it is delivered with the ignorable already stripped (normalize-before-
+    send), so nothing invisible survives to the vendor."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    result = exp.deliver([make_event(1, envelope=_envelope_with_model("gpt\u200b-4o"))])
+
+    assert result["ok"] is True
+    assert len(post.calls) == 1
+    assert post.calls[0][1]["extra"]["metadata"]["model"] == "gpt-4o"
+
+
+def test_langsmith_gate_rejects_obfuscated_sentinel_as_envelope_key_without_post():
+    """R4a2 key-negative: the U+2063-obfuscated sentinel used AS an envelope
+    JSON key must fail closed with zero POSTs, and the key text must appear
+    NOWHERE in detail — neither the raw obfuscated form nor its normalized
+    (de-obfuscated) form. The reported location is opaque (positional)."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    raw_key = "SEN\u2063TINEL-SECRET-VALUE"
+    env = make_envelope()
+    env[raw_key] = "innocuous"
+    result = exp.deliver([make_event(1, envelope=env)])
+
+    assert result["ok"] is False
+    assert result["accepted"] == 0
+    assert post.calls == []  # zero network calls: nothing was POSTed
+    assert raw_key not in result["detail"]
+    assert sinks._strip_default_ignorables(raw_key) not in result["detail"]
+    assert "SENTINEL-SECRET-VALUE" not in result["detail"]
+    # Opaque location: a positional key label, never attacker-controlled text.
+    assert "key[" in result["detail"]
+
+
+def test_langsmith_gate_rejects_plain_banned_key_without_post():
+    """Direct (non-obfuscated) banned key also fails closed with a clean detail."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    env = make_envelope()
+    env["SENTINEL-SECRET-VALUE"] = "innocuous"
+    result = exp.deliver([make_event(1, envelope=env)])
+
+    assert result["ok"] is False
+    assert result["accepted"] == 0
+    assert post.calls == []
+    assert "SENTINEL-SECRET-VALUE" not in result["detail"]
+    assert "key[" in result["detail"]
+
+
 def test_langsmith_partial_accept_is_in_order():
     """Second event fails -> only the first counts accepted (in-order prefix)."""
     post = RecordingPost(fail_on={"ev-0002"})

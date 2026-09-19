@@ -22,8 +22,21 @@ carrying any other top-level key is a redaction violation: it is REJECTED
 (not forwarded, not silently stripped), named in ``detail``, and the batch
 result reports where the accepted in-order prefix ends, per the pinned
 partial-accept semantics. Inside the envelope, the exporter forwards the
-envelope VERBATIM — redaction already happened upstream (B1); the exporter
-adds no fields and has no API to add prompt/response/file content.
+envelope values as-is — redaction already happened upstream (B1); the
+exporter adds no fields and has no API to add prompt/response/file content.
+
+FAIL-CLOSED PRE-SEND LEAKAGE GATE (R-OBS-00 defense in depth): before any
+POST, every string in the ACTUAL outbound payload (envelope values included)
+has its Unicode default-ignorable characters (Cf/Zl/Zp categories plus known
+outliers — the same strip B1's redaction.py applies before ITS matching)
+stripped, and the normalized form is matched against sentinel-marker and
+secret-shape patterns. This defeats obfuscation like U+2063 interleaved into
+a banned marker inside an allowed envelope value: the plain value would
+survive verbatim forwarding and only normalization recovers the marker. On a
+hit the event is REJECTED (no POST occurs, the in-order prefix stops) and
+the violation names only the payload location — never the value. Clean
+strings are delivered with ignorables already stripped (nothing invisible
+survives to the vendor).
 
 Dedupe: like B3's ``LocalFileSink``, a duplicate ``event_id`` counts as
 accepted but is not re-transmitted. Server-side, LangSmith keeps exactly ONE
@@ -56,6 +69,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Callable
@@ -130,6 +145,129 @@ def _parse_iso(ts: str | None) -> datetime | None:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed pre-send leakage gate. Mirrors B1 redaction.py's normalization
+# (strip default-ignorables BEFORE matching) so the sink's last-line gate is
+# never weaker than the emitter's scrubber: Unicode default-ignorable code
+# points are invisible in display but ARE part of the string value, so an
+# attacker can interleave them into banned material inside an allowed
+# envelope value (e.g. U+2063 inside SENTINEL-SECRET-VALUE) to defeat plain
+# substring matching. The strip runs over the ACTUAL outbound payload, the
+# normalized form is matched, and a hit rejects the event with no POST.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_IGNORABLE_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+
+_EXTRA_DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn)
+    (0x115F, 0x1160),  # HANGUL JUNGSEONG/JONGSEONG FILLER (Lo)
+    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ/AA (Mn)
+    (0x180B, 0x180D),  # MONGOLIAN FREE VARIATION SELECTOR ONE-THREE (Mn)
+    (0xFE00, 0xFE0F),  # VARIATION SELECTOR-1..16 (Mn)
+    (0x2065, 0x2065),  # unassigned, default-ignorable (Cn)
+    (0x3164, 0x3164),  # HANGUL FILLER (Lo)
+    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo)
+    (0xFFF0, 0xFFF8),  # unassigned, default-ignorable (Cn)
+    (0xE0000, 0xE0FFF),  # tag characters / variation selectors supplement (Cn)
+)
+
+
+def _is_default_ignorable(ch: str) -> bool:
+    if unicodedata.category(ch) in _DEFAULT_IGNORABLE_CATEGORIES:
+        return True
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _EXTRA_DEFAULT_IGNORABLE_RANGES)
+
+
+def _strip_default_ignorables(value: str) -> str:
+    """Remove every Unicode default-ignorable character from ``value``."""
+    if not value:
+        return value
+    return "".join(ch for ch in value if not _is_default_ignorable(ch))
+
+
+# Sentinel-marker prefix (contract §3.3 redaction-leakage scan markers, e.g.
+# SENTINEL-SECRET-VALUE) matched case-insensitively, plus the secret-shape
+# patterns mirrored from B1 redaction.py (conservative: must not false-positive
+# on ordinary model ids like "gpt-4o" or "z-ai/glm-5.3-flash").
+_SENTINEL_MARK_RE = re.compile(r"SENTINEL-", re.IGNORECASE)
+
+_SECRET_SHAPE_RES: tuple[re.Pattern, ...] = (
+    # OpenAI-style keys: sk-...
+    re.compile(r"sk-[A-Za-z0-9][A-Za-z0-9_-]{12,}"),
+    # Anthropic-style keys
+    re.compile(r"sk-ant-[A-Za-z0-9_-]{16,}"),
+    # GitHub tokens
+    re.compile(r"(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{22,}"),
+    # AWS
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    # Slack
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    # Bearer / token headers
+    re.compile(r"(?:Bearer|bearer|Token|token)\s+[A-Za-z0-9._~+/-]{16,}={0,2}"),
+    # Sentry DSNs (16+ hex chars as the public key — B1 redaction.py mirror)
+    re.compile(r"https://[0-9a-f]{16,}@[a-z0-9.-]+/[0-9a-f]*", re.IGNORECASE),
+    # Private key blocks
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    # URLs embedding credentials: scheme://user:secret@host
+    re.compile(r"[a-z][a-z0-9+.-]*://[^/\s:@]+:[^@\s/]+@", re.IGNORECASE),
+)
+
+
+def _banned_material(normalized: str) -> bool:
+    """True when the normalized string matches a sentinel marker or secret shape."""
+    if _SENTINEL_MARK_RE.search(normalized):
+        return True
+    return any(pattern.search(normalized) for pattern in _SECRET_SHAPE_RES)
+
+
+def _normalize_outbound(node: object, path: str) -> tuple[object, str | None]:
+    """Normalize one outbound-payload node; return ``(normalized, violation)``.
+
+    Every string (value or JSON key) has its default-ignorable characters
+    stripped, and the normalized form is matched against sentinel/secret
+    shapes. ``violation`` is non-None on a hit — the caller must reject the
+    event without any POST and must never echo the offending value. Keys are
+    normalized too: they ride in the outbound JSON exactly like values.
+
+    Key locations in ``violation`` are opaque: because the raw (or even the
+    normalized) key text is attacker-controlled, it is never interpolated
+    into the detail path — positional ``key[i]`` labels are used instead
+    (R4a2: an obfuscated banned key must not be echoed back in detail).
+    """
+    if isinstance(node, dict):
+        normalized: dict = {}
+        for index, (key, value) in enumerate(node.items()):
+            # Opaque key location: report ``path.key[i]``, never the key text.
+            child_path = f"{path}.key[{index}]"
+            if isinstance(key, str):
+                plain_key = _strip_default_ignorables(key)
+                if _banned_material(plain_key):
+                    return None, f"banned material at {child_path} (key; value withheld)"
+            else:
+                plain_key = key
+            clean, violation = _normalize_outbound(value, child_path)
+            if violation:
+                return None, violation
+            normalized[plain_key] = clean
+        return normalized, None
+    if isinstance(node, list):
+        cleaned = []
+        for index, item in enumerate(node):
+            clean, violation = _normalize_outbound(item, f"{path}[{index}]")
+            if violation:
+                return None, violation
+            cleaned.append(clean)
+        return cleaned, None
+    if isinstance(node, str):
+        plain = _strip_default_ignorables(node)
+        if _banned_material(plain):
+            return None, f"banned material at {path} (value withheld)"
+        return plain, None
+    return node, None
 
 
 def _default_post(url: str, body: dict, headers: dict, timeout: float) -> int:
@@ -278,7 +416,9 @@ class LangSmithExporter(Sink):
         """Build the LangSmith run-create payload for one pinned record.
 
         Returns ``(payload, violation)``; ``violation`` is non-None when the
-        event failed the pinned-keys gate and must not be forwarded.
+        event failed the pinned-keys gate OR the fail-closed pre-send leakage
+        gate (banned material recovered from an allowed value after
+        default-ignorable normalization) and must not be forwarded.
         """
         event_id, enqueued_at, envelope, violation = _extract(event)
         if violation:
@@ -297,6 +437,11 @@ class LangSmithExporter(Sink):
             "error": None,
             "extra": {"metadata": metadata},
         }
+        # Pre-send gate over the ACTUAL outbound payload (docstring: fail-closed
+        # leakage gate). Normalize first, match second; a hit rejects the event.
+        payload, leak_violation = _normalize_outbound(payload, "payload")
+        if leak_violation:
+            return {}, leak_violation
         return payload, None
 
     def deliver(self, events: list[dict]) -> dict:
