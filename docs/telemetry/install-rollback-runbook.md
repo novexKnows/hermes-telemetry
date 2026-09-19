@@ -2,17 +2,26 @@
 
 - **Status:** executed end-to-end — every command below was actually run, and the
   "Expected output" blocks are the real captured output of that run (no
-  reconstruction, no placeholders).
+  reconstruction, no placeholders). This is the **corrected re-execution** after
+  review round 1 (task `t_ac41c94b`): archive pinned to the immutable integration
+  SHA, home overrides moved before every runtime invocation (including
+  `hermes --version`), the version call's artifacts added to the rollback,
+  and an explicit environment-rollback step added.
 - **Executed:** 2026-09-19 (Eastern Daylight Time)
 - **Runtime:** Hermes Agent v0.21.3 (2026.9.14), upstream 0ddba07a, editable
   install at `C:\Users\Sovav\AppData\Local\hermes\hermes-agent` (Python 3.11.16,
   venv `...\hermes-agent\venv`) — used **read-only**; the CLI is invoked, never
   modified.
-- **Plugin source:** hermes-telemetry integration tip `9a66874`
-  (`git archive HEAD` of branch `wt/htc-integration`).
+- **Plugin source:** hermes-telemetry integration tip, archived from the
+  **immutable SHA `9a66874`** (`git archive 9a66874` of branch
+  `wt/htc-integration`). Do NOT archive `HEAD`: `HEAD` moves as this runbook's
+  own commits land on the worktree branch, and `git archive HEAD` on the
+  corrected branch exports **124** files (the runbook commits included) instead
+  of the expected **123** — this exact drift was caught in review round 1.
 - **Platform:** Windows 11, git-bash (MSYS) shell.
 - **Proof method:** full file inventory + SHA-256 of every file in the disposable
-  home, before install and after rollback, diffed.
+  home, before install and after rollback, diffed; plus a live-board row-count
+  leak check around the kanban-correlation probe (§5).
 - **Credentials needed:** none. This runbook performs no network/LLM calls and
   requires no sandbox or provider credentials.
 
@@ -55,6 +64,16 @@
    recreate it freely. The worktree `C:/tmp/hermes-telemetry/c2-runbook` is only
    read from (`git archive`) — one pip-probe exception in §2, which writes
    nothing.
+6. **Three-pin isolation for kanban-correlation exports.** §5 stamps the
+   plugin's envelopes with `HERMES_KANBAN_*` values. If you export ANY kanban
+   correlation var, you MUST also override BOTH `HERMES_KANBAN_DB` and
+   `HERMES_KANBAN_BOARD` to disposable values — a worker/CLI context can mutate
+   the LIVE board through them (the runtime fence, `hermes_cli/kanban_db.py:147`,
+   only protects `delegate_task` child contexts, not your own shell). §5 uses a
+   non-live board name and a nonexistent disposable DB path, and brackets the
+   probe with a **read-only row-count leak check** on the live board DB
+   (`capture/live_board_leak_check.py`): the counts must be identical before and
+   after.
 
 ---
 
@@ -77,13 +96,22 @@ Expected output (real):
 Every file that exists later was created by the install/verify run, and the
 rollback in §6 must remove all of them.
 
-Runtime identity, for the record:
+The home overrides are exported **BEFORE** the first runtime invocation —
+including the `hermes --version` identity check below. (`--version` is a real
+runtime invocation: it performs an update check and **creates
+`<HERMES_HOME>/.update_check` and `<HERMES_HOME>/SOUL.md`**. With the overrides
+in place those land in the disposable home, where §6.3 removes them; without
+them they would pollute the real home — this ordering was a review-round-1
+blocker.)
 
 ```bash
+export HERMES_HOME=C:/tmp/htc-c2-runbook/disposable-home
+export HERMES_TELEMETRY_HOME=C:/tmp/htc-c2-runbook/disposable-home
+export HERMES_TELEMETRY_NO_SETUP=1
 hermes --version
 ```
 
-Expected output (real):
+Expected output (real, exit 0):
 
 ```
 Hermes Agent v0.21.3 (2026.9.14) · upstream 0ddba07a
@@ -91,7 +119,12 @@ Install directory: C:\Users\Sovav\AppData\Local\hermes\hermes-agent
 Install method: git
 Python: 3.11.16
 OpenAI SDK: 2.24.0
+Update available: 780 commits behind — run 'hermes update'
 ```
+
+(The `Update available` line is part of the real output; the behind-count grows
+as upstream moves — 780 is what this execution captured. The two files this call
+created are real run artifacts, enumerated and removed in §6.2–§6.3.)
 
 ---
 
@@ -142,12 +175,13 @@ runtime v0.21.3 discovers directory plugins from `<HERMES_HOME>/plugins/<name>/`
 (verified in `hermes_cli/plugins_discovery.py`:
 `user_dir = get_hermes_home() / "plugins"`, honoring `HERMES_HOME`), and a
 directory plugin needs a `plugin.yaml` manifest — which this repo ships at its
-root. Install = copy the approved tree into that directory:
+root. Install = copy the approved tree into that directory, archived from the
+**immutable integration SHA** (see the header note on why not `HEAD`):
 
 ```bash
 cd C:/tmp/hermes-telemetry/c2-runbook
 mkdir -p C:/tmp/htc-c2-runbook/disposable-home/plugins/hermes-telemetry
-git archive HEAD --format=tar | tar -x -C C:/tmp/htc-c2-runbook/disposable-home/plugins/hermes-telemetry
+git archive 9a66874 --format=tar | tar -x -C C:/tmp/htc-c2-runbook/disposable-home/plugins/hermes-telemetry
 find C:/tmp/htc-c2-runbook/disposable-home/plugins/hermes-telemetry -type f | wc -l
 ```
 
@@ -157,14 +191,16 @@ Expected output (real):
 123
 ```
 
-(`git archive HEAD` exports the approved integration tip without `.git`, build
-artifacts, or uncommitted files.)
+(`git archive 9a66874` exports the approved integration tip without `.git`,
+build artifacts, or uncommitted files — exactly 123 files. The same command
+against `HEAD` on this branch exports 124.)
 
 ---
 
 ## 3. Enable — `hermes plugins enable` from the INSTALLED runtime
 
-All remaining steps run under the disposable environment:
+All remaining steps run under the disposable environment (exported in §1; the
+exports are repeated here so each block is copy-paste-runnable on its own):
 
 ```bash
 export HERMES_HOME=C:/tmp/htc-c2-runbook/disposable-home
@@ -219,7 +255,9 @@ Expected output (real):
 enabled      user     0.8.0    hermes-telemetry
 ```
 
-The enable step wrote `config.yaml` into the disposable home:
+The enable step wrote `config.yaml` into the disposable home (the runtime also
+appends generated comment sections — Security, Fallback Model — elided here;
+the plugins block is what the enable step wrote):
 
 ```yaml
 plugins:
@@ -382,25 +420,51 @@ con.close()
 print("DRIVER OK")
 ```
 
-Run it (kanban-correlation env vars give the envelopes real values; adjust to
-your run):
+Save the leak-check helper as `C:/tmp/htc-c2-runbook/capture/live_board_leak_check.py`
+(read-only row counts on the LIVE board DB — §0.6):
+
+```python
+"""HTC-C2-FIX leak check — read-only row counts on the LIVE hermes-telemetry board DB.
+Run before and after any probe that exports kanban correlation vars.
+Read-only URI mode; never writes the live board."""
+import sqlite3
+
+db = r"C:\Users\Sovav\AppData\Local\hermes\kanban\boards\hermes-telemetry\kanban.db"
+con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+print("tables:", tables)
+for t in tables:
+    print(f"count[{t}] =", con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+con.close()
+```
+
+Run it (three-pin isolation, §0.6: the correlation exports point at a
+non-live board name and a nonexistent disposable DB path; adjust the
+task/run/branch values to your run):
 
 ```bash
 cd C:/tmp/htc-c2-runbook
+python capture/live_board_leak_check.py
 export HERMES_HOME=C:/tmp/htc-c2-runbook/disposable-home
 export HERMES_TELEMETRY_HOME=C:/tmp/htc-c2-runbook/disposable-home
 export HERMES_TELEMETRY_NO_SETUP=1
-export HERMES_KANBAN_BOARD=hermes-telemetry
-export HERMES_KANBAN_TASK=t_7f1d2cc9
-export HERMES_KANBAN_RUN_ID=47
+export HERMES_KANBAN_BOARD=htc-c2-runbook-disposable
+export HERMES_KANBAN_DB=C:/tmp/htc-c2-runbook/capture/disposable-kanban.db
+export HERMES_KANBAN_TASK=t_9efbcd24
+export HERMES_KANBAN_RUN_ID=51
 export HERMES_KANBAN_BRANCH=wt/htc-c2-runbook
-export HERMES_KANBAN_PARENT_TASK_IDS=t_c41b91f5
 python capture/event_flow_driver.py
+ls capture/disposable-kanban.db 2>/dev/null || echo "ABSENT (probe never touched a board DB)"
+python capture/live_board_leak_check.py
 ```
 
-Expected output (real, exit 0):
+Expected output (real, driver exit 0; leak-check counts elided to the two rows
+that matter for the proof — the full table list is 8 tables, all identical
+before/after):
 
 ```
+count[tasks] = 54            # BEFORE probe
+count[task_runs] = 52        # BEFORE probe
 hermes-telemetry: no price for model 'runbook/disposable-proof' under provider 'runbook-proof' — cost recorded as $0.00. Add it (under the provider's native model id) to ~/.hermes/telemetry/pricing.yaml to fix.
 plugin loaded: True | enabled: True
 hooks registered: ['api_request_error', 'on_session_end', 'on_session_finalize', 'on_session_start', 'post_api_request', 'post_llm_call', 'post_tool_call', 'pre_api_request', 'pre_llm_call', 'pre_tool_call', 'subagent_start', 'subagent_stop']
@@ -414,20 +478,23 @@ pre_tool_call -> [] (empty => no block; budgets OFF)
 on_session_end -> []
 on_session_finalize -> []
 envelope ring records: 6
-  hook=on_session_start     board=hermes-telemetry task=t_7f1d2cc9 run=47 branch=wt/htc-c2-runbook profile=default call_class=primary
-  hook=pre_api_request      board=hermes-telemetry task=t_7f1d2cc9 run=47 branch=wt/htc-c2-runbook profile=default call_class=primary
-  hook=post_api_request     board=hermes-telemetry task=t_7f1d2cc9 run=47 branch=wt/htc-c2-runbook profile=default call_class=primary
-  hook=pre_tool_call        board=hermes-telemetry task=t_7f1d2cc9 run=47 branch=wt/htc-c2-runbook profile=default call_class=primary
-  hook=on_session_end       board=hermes-telemetry task=t_7f1d2cc9 run=47 branch=wt/htc-c2-runbook profile=default call_class=primary
-  hook=on_session_finalize  board=hermes-telemetry task=t_7f1d2cc9 run=47 branch=wt/htc-c2-runbook profile=default call_class=primary
+  hook=on_session_start     board=htc-c2-runbook-disposable task=t_9efbcd24 run=51 branch=wt/htc-c2-runbook profile=default call_class=primary
+  hook=pre_api_request      board=htc-c2-runbook-disposable task=t_9efbcd24 run=51 branch=wt/htc-c2-runbook profile=default call_class=primary
+  hook=post_api_request     board=htc-c2-runbook-disposable task=t_9efbcd24 run=51 branch=wt/htc-c2-runbook profile=default call_class=primary
+  hook=pre_tool_call        board=htc-c2-runbook-disposable task=t_9efbcd24 run=51 branch=wt/htc-c2-runbook profile=default call_class=primary
+  hook=on_session_end       board=htc-c2-runbook-disposable task=t_9efbcd24 run=51 branch=wt/htc-c2-runbook profile=default call_class=primary
+  hook=on_session_finalize  board=htc-c2-runbook-disposable task=t_9efbcd24 run=51 branch=wt/htc-c2-runbook profile=default call_class=primary
 transport dir: C:\tmp\htc-c2-runbook\disposable-home\telemetry\transport
-enqueue receipt: {"event_id": "evt_e01b96e2193f4e5993e56ce015405227", "journal_offset": 0}
-transport status: {"cursor_offset": 0, "delivered": 0, "journaled": 1, "last_success_at": null, "oldest_pending_age_seconds": 0.007, "outage_open": false, "pending": 1, "sink_configured": false, "torn_truncations": 0, "transport_dir": "C:\\tmp\\htc-c2-runbook\\disposable-home\\telemetry\\transport"}
+enqueue receipt: {"event_id": "evt_e188d5c4411c48efaa2800f3754ae778", "journal_offset": 0}
+transport status: {"cursor_offset": 0, "delivered": 0, "journaled": 1, "last_success_at": null, "oldest_pending_age_seconds": 0.005, "outage_open": false, "pending": 1, "sink_configured": false, "torn_truncations": 0, "transport_dir": "C:\\tmp\\htc-c2-runbook\\disposable-home\\telemetry\\transport"}
 journal exists: True | lines: 1
 telemetry.db: C:\tmp\htc-c2-runbook\disposable-home\telemetry\telemetry.db | exists: True
 runs row: ('htc-c2-runbook-proof-001', 'runbook/disposable-proof', 'cli', 'default', 'ok')
 llm_calls row: ('htc-c2-runbook-proof-001', 'runbook/disposable-proof', 'runbook-proof', 1200, 340, 0.0, 421)
 DRIVER OK
+ABSENT (probe never touched a board DB)
+count[tasks] = 54            # AFTER probe — identical
+count[task_runs] = 52        # AFTER probe — identical
 ```
 
 Reading the proof:
@@ -437,7 +504,12 @@ Reading the proof:
   **not** block on `pre_tool_call` (budgets OFF holds on the enforcement path,
   not just the file check).
 - 6 envelopes, one per fired hook, each carrying the correlation fields
-  (board/task/run/branch) and `call_class=primary`.
+  (board/task/run/branch) and `call_class=primary`. The board value is the
+  **non-live disposable name** and the disposable DB path was never created —
+  three-pin isolation held (§0.6).
+- The live-board row-count leak check is **identical before and after**
+  (`tasks=54`, `task_runs=52`; all 8 tables compared, zero delta) — the probe
+  mutated nothing on the live board.
 - The transport journal holds the event durably (`journaled: 1, pending: 1,
   sink_configured: false`) — exactly the fail-closed contract: with no sink
   configured, the event is fsynced to `events.jsonl` and waits; nothing is lost,
@@ -478,11 +550,14 @@ cd C:/tmp/htc-c2-runbook
 find disposable-home -type f | sort | sed 's|disposable-home/||'
 ```
 
-Expected output (real):
+Expected output (real — **12 residual files**; the count and list include the
+`.update_check` stamp the §1 version call wrote under the overrides, which a
+previous execution missed):
 
 ```
-backups/config/config.yaml.good.20260919-142127
-backups/config/config.yaml.good.20260919-142132
+.update_check
+backups/config/config.yaml.good.20260919-145540
+backups/config/config.yaml.good.20260919-145550
 cache/plugin-catalog.json
 config.yaml
 SOUL.md
@@ -500,18 +575,23 @@ Every one of these was created after the pre-install inventory was taken
 - `telemetry/*` — plugin state (SQLite DB, durable journal + cursor state,
   pricing cache, log).
 - `config.yaml`, `backups/config/*` — runtime config written by enable/remove
-  (the runtime keeps its own `.good` backups on each edit).
+  (the runtime keeps its own `.good` backups on each edit; the timestamps
+  differ per run).
 - `cache/plugin-catalog.json`, `SOUL.md` — runtime home-init artifacts.
+- `.update_check` — the runtime's update-check stamp, written by the §1
+  `hermes --version` call (under the overrides, so it landed here and not in
+  the real home).
 
 ### 6.3 Remove them and re-inventory
 
 On a **disposable** home used only for this verification, full restoration means
-removing everything the run created:
+removing everything the run created — **including `.update_check`**, or the
+final inventory will not be identical to §1:
 
 ```bash
 cd C:/tmp/htc-c2-runbook
 rm -rf disposable-home/telemetry disposable-home/backups disposable-home/cache \
-       disposable-home/config.yaml disposable-home/SOUL.md
+       disposable-home/config.yaml disposable-home/SOUL.md disposable-home/.update_check
 # The runtime's home-init also created empty skeleton directories; remove them
 # so the home is byte-identical to §1:
 rmdir disposable-home/audio_cache disposable-home/cron disposable-home/hooks \
@@ -536,10 +616,37 @@ disposable-home
 home was **0 files before install** (§1) and **0 files after rollback** (§6.3);
 the SHA-256 manifests `inventory-before.txt` and `inventory-after.txt` both
 empty; `diff` reports them **IDENTICAL**, and the home contains no files and no
-directories. No plugin code, no telemetry state, no config, and no journal data
-survived.
+directories. No plugin code, no telemetry state, no config, no update-check
+stamp, and no journal data survived.
 
-### 6.4 Variant for a REAL home (not executed — do not run on `~/.hermes` blindly)
+### 6.4 Environment rollback — unset every export the runbook made
+
+The runbook exported `HERMES_HOME`, `HERMES_TELEMETRY_HOME`,
+`HERMES_TELEMETRY_NO_SETUP` and the §5 kanban-correlation variables. A shell
+that keeps them exported will silently pin every later `hermes` command (and
+any kanban-touching tool) to the disposable home / disposable board — a review
+round 1 blocker. Roll them back and VERIFY:
+
+```bash
+unset HERMES_HOME HERMES_TELEMETRY_HOME HERMES_TELEMETRY_NO_SETUP \
+      HERMES_KANBAN_BOARD HERMES_KANBAN_DB HERMES_KANBAN_TASK \
+      HERMES_KANBAN_RUN_ID HERMES_KANBAN_BRANCH HERMES_KANBAN_PARENT_TASK_IDS
+test -z "$HERMES_HOME" && test -z "$HERMES_TELEMETRY_HOME" && \
+test -z "$HERMES_TELEMETRY_NO_SETUP" && test -z "$HERMES_KANBAN_DB" && \
+test -z "$HERMES_KANBAN_BOARD" && \
+echo "ENV ROLLBACK OK: no HERMES / kanban overrides remain exported" || \
+echo "ENV ROLLBACK INCOMPLETE"
+```
+
+Expected output (real):
+
+```
+ENV ROLLBACK OK: no HERMES / kanban overrides remain exported
+```
+
+(`unset` is idempotent — variables you did not set are simply still unset.)
+
+### 6.5 Variant for a REAL home (not executed — do not run on `~/.hermes` blindly)
 
 On a home with other state you want to keep, restore only the plugin-scoped
 pieces:
@@ -552,7 +659,8 @@ pieces:
    plugin, see `paths.py` docstring).
 3. Re-run your pre-install inventory diff (§1/§6.3) — everything NOT under
    `plugins/hermes-telemetry/` or `telemetry/` must be unchanged except the
-   `config.yaml` plugin entry (verify against the `.good` backup).
+   `config.yaml` plugin entry (verify against the `.good` backup) and the
+   `.update_check` stamp (delete it if it did not exist pre-install).
 
 ---
 
@@ -562,16 +670,20 @@ pieces:
 |---|------|---------|--------|
 | 1 | §1 | `find disposable-home -type f \| wc -l` | `0` |
 | 2 | §1 | `find ... -exec sha256sum {} + \| sort > inventory-before.txt` | empty manifest |
-| 3 | §1 | `hermes --version` | v0.21.3 (2026.9.14) |
+| 3 | §1 | exports + `hermes --version` | v0.21.3 (2026.9.14) + `Update available: 780 commits behind`; created `.update_check` + `SOUL.md` in the disposable home |
 | 4 | §2 | `pip install --no-deps -e .` | exit 1 — metadata-generation-failed, 0 egg-info (known caveat) |
-| 5 | §2 | `git archive HEAD --format=tar \| tar -x -C ...` | 123 files installed |
+| 5 | §2 | `git archive 9a66874 --format=tar \| tar -x -C ...` | 123 files installed |
 | 6 | §3 | `hermes plugins list --plain --no-bundled` (pre) | `not enabled  user 0.8.0 hermes-telemetry` |
 | 7 | §3 | `hermes plugins enable hermes-telemetry` | exit 0, enabled, deps satisfied |
 | 8 | §3 | `hermes plugins list --plain --no-bundled` (post) | `enabled  user 0.8.0 hermes-telemetry` |
 | 9 | §4 | `test -f .../telemetry/budget.yaml` | ABSENT (budgets disabled) |
-| 10 | §5 | `python capture/event_flow_driver.py` | exit 0 — 6 envelopes, journal `journaled:1 pending:1`, DB rows present, no budget block |
-| 11 | §6.1 | `hermes plugins remove hermes-telemetry` | exit 0, plugin dir gone |
-| 12 | §6.2 | `find disposable-home -type f \| sort` | 11 residual files enumerated |
-| 13 | §6.3 | `rm -rf ...` + `rmdir ...` + re-inventory | `0` files; `diff`: IDENTICAL |
+| 10 | §5 | `python capture/live_board_leak_check.py` (before) | 8 tables, `tasks=54`, `task_runs=52` |
+| 11 | §5 | `python capture/event_flow_driver.py` | exit 0 — 6 envelopes (disposable board), journal `journaled:1 pending:1`, DB rows present, no budget block |
+| 12 | §5 | disposable-DB check + `live_board_leak_check.py` (after) | DB ABSENT; counts identical (`tasks=54`, `task_runs=52`) — zero live-board delta |
+| 13 | §6.1 | `hermes plugins remove hermes-telemetry` | exit 0, plugin dir gone |
+| 14 | §6.2 | `find disposable-home -type f \| sort` | 12 residual files enumerated (incl. `.update_check`) |
+| 15 | §6.3 | `rm -rf ...` + `rmdir ...` + re-inventory | `0` files; `diff`: IDENTICAL |
+| 16 | §6.4 | `unset ...` + `test -z` guard | `ENV ROLLBACK OK` |
 
-Total: 13 executed commands (plus the driver), all with the real outputs above.
+Total: 16 executed commands (plus the driver and leak-check scripts), all with
+the real outputs above.
