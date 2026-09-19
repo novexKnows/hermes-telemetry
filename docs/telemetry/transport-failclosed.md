@@ -4,7 +4,11 @@ Scope: `transport.py` (durable local queue for ratified R-OBS-00 envelopes),
 the pinned sink interface consumed by B4 exporters, the outage ledger, and the
 `/telemetry-status` surface. Envelope schema and redaction are owned by B1
 (R-OBS-00 v1.0.0); the transport receives **already-redacted envelope dicts**
-and asserts this as a precondition — it never redacts, never drops.
+and ENFORCES this as a concrete metadata-only precondition before journal
+append — envelopes that violate the pinned R-OBS-00 v1.0.0 schema shape
+(sha256 `5271d5fa…e70a`) or carry secret-shaped / content-sentinel strings in
+any field are REJECTED with `ValueError` before the journal is touched. The
+transport never redacts and never silently drops.
 
 ## Design invariants (the fail-closed contract)
 
@@ -50,10 +54,14 @@ Each event dict is:
 
 Semantics: `accepted` counts events durable at the sink IN ORDER; everything
 beyond the accepted prefix stays pending and is retried (partial accept). A
-duplicate `event_id` counts as accepted and is not re-written. Timeout
-enforcement is the sink's responsibility (B4 owns exporter HTTP timeouts); the
-transport treats any exception or non-conforming result as a failed attempt
-and retries with exponential backoff (`base * 2^n`, capped).
+duplicate `event_id` counts as accepted and is not re-written. The result is
+validated STRICTLY: all three fields must be present with exact types
+(`ok: bool`, `accepted: int` — a real int, not bool — in `0..len(batch)`,
+`detail: str`); any missing key, wrong type, or out-of-range count is a failed
+attempt and NEVER advances the cursor. Timeout enforcement is the sink's
+responsibility (B4 owns exporter HTTP timeouts); the transport treats any
+exception or non-conforming result as a failed attempt and retries with
+exponential backoff (`base * 2^n`, capped).
 
 Delivery retry policy (defaults): `max_retries=5`, `base_delay_s=0.05`,
 `max_delay_s=2.0`, `batch_size=100`. A success resets the retry budget for the
@@ -78,10 +86,18 @@ Supplementary non-matrix tests:
 | Receipts + status remain queryable while the sink never returns (flush blocked in another thread) | `test_receipts_queryable_while_sink_never_returns` |
 | `LocalFileSink` conformance: `{ok, accepted, detail}` result; duplicate event_id accepted-but-not-rewritten | `test_local_file_sink_conformance_and_dedupe` |
 | No sink configured → fail-closed (pending, not fatal), status reports `sink_configured: false` | `test_no_sink_configured_is_fail_closed_not_fatal` |
-| Non-conforming sink result (missing `ok`) treated as failed attempt, not crash | `test_non_conforming_sink_result_treated_as_failure` |
-| Non-dict envelope rejected; envelope missing base fields journaled anyway with a warning (fail-closed) | `test_enqueue_rejects_non_dict_and_warns_on_missing_fields` |
+| Non-conforming sink result (missing `ok`) treated as failed attempt, not crash; ledger opens | `test_non_conforming_sink_result_treated_as_failure` |
+| Malformed `{"ok": true}` (missing `accepted`) is a failed attempt: cursor never advances, receipt undelivered, outage recorded | `test_malformed_ok_true_sink_result_never_advances_cursor` |
+| Strict sink-result typing: bool `accepted`, out-of-range/negative counts, non-bool `ok`, non-str `detail` all rejected | `test_malformed_sink_result_wrong_types_rejected` |
+| One-attempt failure (`max_retries=1`) still opens the durable outage ledger | `test_one_attempt_failure_opens_outage_ledger` |
+| `ok=true/accepted=0` terminal path opens the outage ledger | `test_ok_zero_accepted_opens_outage_ledger` |
+| Partial-accept terminal path opens the outage ledger for the remainder | `test_partial_accept_terminal_opens_outage_for_remainder` |
+| Envelope precondition enforced: unknown fields / missing base fields / Turnstone-vs-harness shape violations rejected before journal append | `test_enqueue_rejects_unknown_fields`, `test_enqueue_rejects_envelope_missing_base_fields`, `test_turnstone_originated_envelope_requires_extensions` |
+| Sentinel-leak rejection: secret-shaped strings and PROMPT_TEXT/RESPONSE_TEXT/FILE_CONTENT sentinels in any field rejected before journal append | `test_enqueue_rejects_secret_shaped_and_content_sentinels` |
+| Pinned schema drift guard: embedded shape pinned to the ratified R-OBS-00 v1.0.0 schema copy (sha256) | `test_pinned_schema_hash_matches` |
+| Double-env isolation: journal lands in the disposable pinned roots; real-home files untouched | `test_transport_journal_isolated_from_real_home` + `test_conftest_pins_ambient_telemetry_home` (tests/test_isolation.py) |
 | `/telemetry-status` human + machine-readable (`json` arg) output with the pinned count keys | `test_handle_status_human_and_json` |
-| Store lives under disposable HERMES_HOME (never real `~/.hermes`) | `test_transport_store_lives_under_hermes_home` + conftest autouse fixture |
+| Store lives under disposable HERMES_TELEMETRY_HOME/HERMES_HOME (never real `~/.hermes`) | `test_transport_store_lives_under_hermes_home` + conftest autouse fixture |
 | Concurrent enqueue: unique event_ids and journal offsets, complete drain | `test_concurrent_enqueue_offsets_unique_and_complete` |
 
 ## Status surface

@@ -44,8 +44,11 @@ def isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows equivalent of HOME
     # HERMES_TELEMETRY_HOME outranks HERMES_HOME (paths.get_telemetry_home);
     # a developer's ambient value would otherwise override the tmp redirect and
-    # leak the suite into the real ~/.hermes/telemetry. Clear it per test.
-    monkeypatch.delenv("HERMES_TELEMETRY_HOME", raising=False)
+    # leak the suite into the real ~/.hermes/telemetry. PIN it (don't just
+    # delete it): pinning means an ambient value can never leak through and the
+    # resolution target is always a disposable root. test_transport.py's
+    # double_isolation fixture re-pins it per-test as a second layer.
+    monkeypatch.setenv("HERMES_TELEMETRY_HOME", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)

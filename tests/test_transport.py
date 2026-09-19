@@ -1,22 +1,75 @@
 """Tests for the durable event transport (HTB-B3).
 
 Covers every row of the outage/staleness matrix in
-docs/telemetry/transport-failclosed.md. HERMES_HOME isolation comes from the
-autouse conftest fixture (every test gets a fresh tmp HERMES_HOME), and
-transports are additionally pointed at explicit tmp dirs where multiple
+docs/telemetry/transport-failclosed.md. Isolation is double-pinned: the
+autouse conftest fixture AND the ``double_isolation`` fixture below both set
+HERMES_HOME and HERMES_TELEMETRY_HOME to disposable tmp homes — regression
+guard for the A2 isolation incident (t_c8fca739): paths.py gives
+HERMES_TELEMETRY_HOME priority over HERMES_HOME, so a test overriding only
+HERMES_HOME while an ambient HERMES_TELEMETRY_HOME leaks through writes into
+the REAL telemetry DB — pin, never delete.
+Transports are additionally pointed at explicit tmp dirs where multiple
 instances share a store.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
+from hermes_telemetry import paths as paths_mod
 from hermes_telemetry import transport as tmod
 from hermes_telemetry.transport import LocalFileSink, MockSink, Transport
+
+# ---------------------------------------------------------------------------
+# Isolation (A2 incident regression guard)
+#
+# The two module-level captures below run at IMPORT time, i.e. BEFORE the
+# autouse fixtures pin HOME/USERPROFILE/HERMES_* to tmp dirs — so they capture
+# what the developer's REAL telemetry home is on this machine. The isolation
+# regression test snapshots it and proves the transport never writes there.
+# ---------------------------------------------------------------------------
+
+_REAL_TELEMETRY_HOME_NO_ENV = (
+    Path(
+        os.environ.get("HERMES_TELEMETRY_HOME")
+        or os.environ.get("HERMES_HOME")
+        or (Path.home() / ".hermes")
+    )
+    / "telemetry"
+)
+_REAL_HOME_PROBE_SNAPSHOT: dict[Path, tuple[bool, int | None, int | None]] = {
+    p: (
+        p.exists(),
+        p.stat().st_mtime_ns if p.exists() else 0,
+        p.stat().st_size if p.exists() else 0,
+    )
+    for p in (
+        _REAL_TELEMETRY_HOME_NO_ENV / "telemetry.db",
+        _REAL_TELEMETRY_HOME_NO_ENV / "telemetry.log",
+    )
+}
+
+# ---------------------------------------------------------------------------
+# Isolation (A2 incident regression guard)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def double_isolation(tmp_path, monkeypatch):
+    """Every B3 test pins BOTH HERMES_HOME and HERMES_TELEMETRY_HOME to the
+    disposable tmp home. The conftest autouse fixture pins both as well; a
+    second pin here means an ambient value re-set later (or a missed conftest
+    layer) can never outrank the disposable roots via paths.py — never rely on
+    deletion alone."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_TELEMETRY_HOME", str(tmp_path / "telemetry-home"))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -360,21 +413,186 @@ def test_non_conforming_sink_result_treated_as_failure(tmp_path):
     t.enqueue(make_envelope())
     summary = t.flush()
     assert summary["ok"] is False and summary["pending"] == 1
+    assert "non-conforming sink result" in summary["detail"]
+    # Terminal path: even a one-attempt failure must open the outage ledger.
+    assert t.status()["outage_open"] is True
+
+
+def test_malformed_ok_true_sink_result_never_advances_cursor(tmp_path):
+    """BLOCKING regression: a malformed sink result ``{"ok": true}`` (missing
+    ``accepted``) must NOT be treated as full acceptance. Nothing is persisted
+    at the sink, so the cursor must not advance: pending stays > 0 and the
+    receipt stays undelivered."""
+    sink = MockSink(lambda events, calls: {"ok": True})  # no accepted, no detail
+    t = make_transport(sink, tmp_path, max_retries=1)
+    receipt = t.enqueue(make_envelope(trace="trc_leak"))
+    summary = t.flush()
+    assert summary["ok"] is False and summary["pending"] == 1
+    assert "non-conforming sink result" in summary["detail"]
+    got = t.receipt(receipt["event_id"])
+    assert got is not None and got["delivered"] is False  # cursor NOT advanced
+    assert t.status()["pending"] == 1 and t.status()["delivered"] == 0
+    # Failed attempt -> durable outage evidence, not a silent full acceptance.
+    assert t.status()["outage_open"] is True
+    ledger = (tmp_path / "transport" / "outage_ledger.jsonl").read_text(encoding="utf-8")
+    assert json.loads(ledger.splitlines()[-1])["pending_count"] == 1
+
+
+def test_malformed_sink_result_wrong_types_rejected(tmp_path):
+    """accepted must be a real int (bool is not), in 0..len(batch); detail must
+    be str; ok must be exactly bool. Every wrong-typed result is a failed
+    attempt and the cursor never advances."""
+    t = make_transport(failing_sink(), tmp_path, max_retries=1)
+    t.enqueue(make_envelope())
+    cases = [
+        {"ok": True, "accepted": True, "detail": "bool count"},
+        {"ok": True, "accepted": 2, "detail": "beyond batch"},  # batch of 1
+        {"ok": True, "accepted": -1, "detail": "negative"},
+        {"ok": "yes", "accepted": 1, "detail": "ok not bool"},
+        {"ok": True, "accepted": 1, "detail": 7},
+    ]
+    for result in cases:
+        t.sink = MockSink(lambda events, calls, _r=result: _r)
+        summary = t.flush(max_retries=1)
+        assert summary["ok"] is False, f"case {result!r} must be a failed attempt"
+        assert t.status()["pending"] == 1, f"case {result!r} must not advance the cursor"
+
+
+# ---------------------------------------------------------------------------
+# Outage ledger terminal paths (EVERY flush ending with pending records)
+# ---------------------------------------------------------------------------
+
+
+def test_one_attempt_failure_opens_outage_ledger(tmp_path):
+    """Blocking regression: a max_retries=1 failure must NOT exit before the
+    outage ledger opens — pending=1 with outage_open=true, ledger on disk."""
+    t = make_transport(failing_sink(), tmp_path, max_retries=1)
+    t.enqueue(make_envelope())
+    summary = t.flush()
+    assert summary["ok"] is False and summary["pending"] == 1
+    status = t.status()
+    assert status["outage_open"] is True
+    ledger_path = tmp_path / "transport" / "outage_ledger.jsonl"
+    assert ledger_path.exists()
+    entry = json.loads(ledger_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["event"] == "open" and entry["pending_count"] == 1
+
+
+def test_ok_zero_accepted_opens_outage_ledger(tmp_path):
+    """Terminal path: ok=true / accepted=0 ends the flush with pending records
+    and must durably open the outage ledger."""
+    sink = MockSink(lambda events, calls: {"ok": True, "accepted": 0, "detail": "buffering"})
+    t = make_transport(sink, tmp_path, max_retries=1)
+    t.enqueue(make_envelope())
+    summary = t.flush()
+    assert summary["ok"] is False and summary["pending"] == 1
+    assert t.status()["outage_open"] is True
+    ledger_path = tmp_path / "transport" / "outage_ledger.jsonl"
+    entry = json.loads(ledger_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["event"] == "open" and entry["pending_count"] == 1
+
+
+def test_partial_accept_terminal_opens_outage_for_remainder(tmp_path):
+    """Terminal path: a flush that ends via partial accept leaves the remainder
+    pending and MUST durably open the outage ledger for it."""
+    sink = MockSink(lambda events, calls: {"ok": True, "accepted": 1, "detail": "partial"})
+    t = make_transport(sink, tmp_path)
+    for i in range(3):
+        t.enqueue(make_envelope(trace=f"trc_{i}"))
+    summary = t.flush()
+    assert summary["delivered"] == 1 and summary["pending"] == 2
+    assert t.status()["outage_open"] is True
+    ledger_path = tmp_path / "transport" / "outage_ledger.jsonl"
+    entry = json.loads(ledger_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert entry["event"] == "open" and entry["pending_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Envelope metadata-only boundary (redaction precondition, ENFORCED)
+# ---------------------------------------------------------------------------
+
+
+def test_enqueue_rejects_non_dict(tmp_path):
+    t = make_transport(failing_sink(), tmp_path)
+    with pytest.raises(TypeError):
+        t.enqueue("not-an-envelope")
+
+
+def test_enqueue_rejects_envelope_missing_base_fields(tmp_path):
+    """The redaction/schema precondition is enforced: an envelope missing
+    required base fields violates the pinned v1.0.0 shape and is REJECTED
+    before journal append (not merely warned about)."""
+    t = make_transport(failing_sink(), tmp_path)
+    with pytest.raises(ValueError, match="before journal append"):
+        t.enqueue({"task_id": "t_x"})
+    assert t.status()["journaled"] == 0  # nothing was journaled
+
+
+def test_enqueue_rejects_unknown_fields(tmp_path):
+    envelope = make_envelope()
+    envelope["prompt"] = "you must never see this"  # not in the pinned schema
+    t = make_transport(failing_sink(), tmp_path)
+    with pytest.raises(ValueError, match="unknown field"):
+        t.enqueue(envelope)
+    assert t.status()["journaled"] == 0
+
+
+def test_enqueue_rejects_secret_shaped_and_content_sentinels(tmp_path):
+    """Sentinel-leak rejection: banned marker content (secret-shaped strings,
+    prompt/response/file content) in ANY field is rejected before journal
+    append — nothing is written to the journal."""
+    t = make_transport(failing_sink(), tmp_path)
+    leaks = {
+        "api key in key_id": ("key_id", "label:sk-proj-abcdef1234567890abcdef"),
+        "github token in model": ("model", "ghp_" + "a1B2c3D4e5F6g7H8" * 4),
+        "prompt text in board": ("board", "PROMPT_TEXT: you are a helpful assistant"),
+        "response text in trace": ("trace_id", "RESPONSE_TEXT: leaked answer"),
+        "file content in profile": ("profile/role", "FILE_CONTENT: -----BEGIN PRIVATE KEY-----"),
+    }
+    for name, (field, value) in leaks.items():
+        envelope = make_envelope()
+        envelope[field] = value
+        with pytest.raises(ValueError) as exc_info:
+            t.enqueue(envelope)
+        assert "before journal append" in str(exc_info.value), name
+    assert t.status()["journaled"] == 0
+    journal = t.dir / "events.jsonl"
+    assert not journal.exists() or journal.read_text(encoding="utf-8") == ""
+
+
+def test_turnstone_originated_envelope_requires_extensions(tmp_path):
+    t = make_transport(failing_sink(), tmp_path)
+    bad = make_envelope()
+    bad["repo"] = "turnstone"  # extension fields required on Turnstone events
+    with pytest.raises(ValueError, match="Turnstone event"):
+        t.enqueue(bad)
+    good = dict(bad)
+    for req in tmod._TURNSTONE_REQUIRED:
+        good[req] = "dev" if req == "runtime_environment" else f"val_{req}"
+    receipt = t.enqueue(good)  # conforms: journaled
+    assert receipt["event_id"].startswith("evt_")
+
+
+def test_pinned_schema_hash_matches():
+    """Drift guard: the embedded envelope-shape boundary is pinned to the
+    ratified R-OBS-00 v1.0.0 schema copy (sha256 recorded at pin time)."""
+    import hashlib
+
+    pinned = Path(tmod.PINNED_SCHEMA_PATH)
+    if not pinned.exists():
+        pytest.skip(f"pinned schema copy not present on this machine: {pinned}")
+    digest = hashlib.sha256(pinned.read_bytes()).hexdigest()
+    assert digest == tmod.PINNED_SCHEMA_SHA256
+    schema = json.loads(pinned.read_text(encoding="utf-8"))
+    assert schema["version"] == "1.0.0" and schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(tmod.ENVELOPE_BASE_FIELDS)
+    assert set(schema["properties"]) == set(tmod.ENVELOPE_SCHEMA_FIELDS)
+    assert set(schema["properties"]["call_class"]["enum"]) == set(tmod.ENVELOPE_CALL_CLASSES)
 
 
 # ---------------------------------------------------------------------------
 # Envelope precondition + command surface
 # ---------------------------------------------------------------------------
-
-
-def test_enqueue_rejects_non_dict_and_warns_on_missing_fields(tmp_path, caplog):
-    t = make_transport(failing_sink(), tmp_path)
-    with pytest.raises(TypeError):
-        t.enqueue("not-an-envelope")
-    # Missing base fields: journaled anyway (fail-closed), with a warning.
-    receipt = t.enqueue({"task_id": "t_x"})
-    assert receipt["event_id"].startswith("evt_")
-    assert any("base field" in rec.message for rec in caplog.records)
 
 
 def test_handle_status_human_and_json(tmp_path):
@@ -394,14 +612,47 @@ def test_handle_status_human_and_json(tmp_path):
         assert key in record
 
 
-def test_transport_store_lives_under_hermes_home(monkeypatch, tmp_path):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.delenv("HERMES_TELEMETRY_HOME", raising=False)
+def test_transport_store_lives_under_hermes_home(tmp_path):
+    """Both env pins come from the double_isolation fixture (conftest layer
+    pins them too); the store must resolve under the disposable telemetry
+    home — never the developer's real ~/.hermes."""
     t = make_transport(failing_sink(), None)  # default dir resolution
-    assert str(t.dir).startswith(str(tmp_path))
-    assert (t.dir / "events.jsonl").exists() or True  # dir created on enqueue
+    pinned_home = Path(paths_mod.get_telemetry_home())
+    assert str(t.dir).startswith(str(pinned_home))
     t.enqueue(make_envelope())
     assert (t.dir / "events.jsonl").exists()
+
+
+def test_transport_journal_isolated_from_real_home(tmp_path):
+    """TM isolation directive, transport edition: with BOTH HERMES_HOME and
+    HERMES_TELEMETRY_HOME pinned to disposable roots, the journal must land
+    inside the disposable root and no real-home path (the developer's real
+    telemetry home / ~/.hermes) may be touched — no journal file there, and no
+    modification of pre-existing real-home files by enqueue + flush."""
+    t = make_transport(failing_sink(), None)  # default dir resolution
+    t.enqueue(make_envelope())
+    t.flush()
+
+    # 1. The journal lands inside the disposable pinned roots — nothing else.
+    assert Path(str(t.dir)).is_relative_to(tmp_path), f"journal left the disposable root: {t.dir}"
+    assert (t.dir / "events.jsonl").exists()
+    # 2. The REAL telemetry home (resolved with no env overrides at import
+    # time, i.e. the machine's actual home) was never touched: no transport
+    # journal appeared there, and pre-existing real files were not modified.
+    real_tele = _REAL_TELEMETRY_HOME_NO_ENV
+    real_transport = real_tele / "transport"
+    assert not (real_transport / "events.jsonl").exists(), (
+        f"transport journaled into the real home: {real_transport / 'events.jsonl'}"
+    )
+    for probe_path, (existed, mtime_ns, size) in _REAL_HOME_PROBE_SNAPSHOT.items():
+        assert probe_path.exists() == existed, f"real-home file created during test: {probe_path}"
+        if existed:
+            assert probe_path.stat().st_mtime_ns == mtime_ns and (
+                probe_path.stat().st_size == size
+            ), f"real-home file modified during test: {probe_path}"
+    # 3. The pin target really is inside the disposable tmp root.
+    assert Path(str(t.dir)).is_relative_to(tmp_path)
+    assert paths_mod.get_transport_dir().is_relative_to(tmp_path)
 
 
 # ---------------------------------------------------------------------------

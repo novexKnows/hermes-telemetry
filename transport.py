@@ -31,7 +31,11 @@ Each event dict passed to ``deliver`` is::
         "envelope": {...},      # the R-OBS-00 envelope, verbatim, already redacted
     }
 
-``deliver`` returns ``{"ok": bool, "accepted": int, "detail": str}``:
+``deliver`` returns ``{"ok": bool, "accepted": int, "detail": str}``. The
+result is validated STRICTLY: all three keys must be present with exact types
+(``ok: bool``, ``accepted: int`` (not bool, 0..len(batch)), ``detail: str``);
+any non-conforming result (including a missing ``accepted``) is a failed
+attempt and NEVER advances the cursor.
 ``accepted`` counts events durable at the sink IN ORDER — events beyond the
 accepted prefix remain pending and are retried (partial accept). A duplicate
 ``event_id`` (crash between sink-accept and cursor-persist) counts as accepted;
@@ -39,10 +43,15 @@ the sink dedupes it. Timeout enforcement is the sink's responsibility (B4 owns
 exporter HTTP timeouts); the transport treats any exception or non-conforming
 result as a failed attempt.
 
-Envelope precondition: the transport receives ALREADY-REDACTED envelope dicts
-(B1 owns redaction; redaction always runs before enqueue). ``enqueue`` asserts
-the dict type and warns on missing R-OBS-00 base fields, but never drops an
-event for shape reasons — fail-closed means journal first, questions later.
+Envelope precondition (ENFORCED, not assumed): the transport receives
+ALREADY-REDACTED envelope dicts (B1 owns redaction; redaction always runs
+before enqueue). ``enqueue`` enforces a concrete metadata-only boundary before
+journal append: the envelope must conform to the pinned R-OBS-00 v1.0.0 schema
+shape (see ``PINNED_SCHEMA_SHA256`` and ``_validate_envelope_shape``), must
+contain no unknown fields, and must not carry secret-shaped strings or
+prompt/response/file content sentinels in ANY field. Violations raise
+ValueError before journal append — nothing non-conforming is ever journaled
+or delivered.
 """
 
 from __future__ import annotations
@@ -50,12 +59,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from .paths import get_transport_dir
 
@@ -84,6 +94,220 @@ ENVELOPE_BASE_FIELDS = (
 )
 
 LEDGER_EVENT_ID_CAP = 1000  # cap event-id lists written to a ledger entry
+
+# -----------------------------------------------------------------------------
+# Envelope precondition (metadata-only / schema boundary — R-OBS-00 v1.0.0)
+#
+# ENFORCED, not just documented: `enqueue` rejects (before journal append) any
+# envelope that violates the pinned correlation-envelope v1.0.0 shape or carries
+# banned content in ANY field. The pinned schema copy lives at
+# C:/tmp/sovav-hermes/r-obs-00/docs/telemetry/correlation-envelope.schema.json;
+# its sha256 at pin time is recorded below and checked by a drift test
+# (tests/test_transport.py::test_pinned_schema_hash_matches).
+# -----------------------------------------------------------------------------
+
+#: sha256 of the pinned correlation-envelope.schema.json (v1.0.0).
+PINNED_SCHEMA_SHA256 = "5271d5faa8bee8ad3d58885f4ab54f88d77af6e0620c78ba627665ca8433e70a"
+
+#: Path of the pinned schema copy whose hash is recorded above. Used only by a
+#: drift test (skipped when the copy is not present on the machine).
+PINNED_SCHEMA_PATH = "C:/tmp/sovav-hermes/r-obs-00/docs/telemetry/correlation-envelope.schema.json"
+
+#: Full v1.0.0 property set (schema: additionalProperties false).
+ENVELOPE_SCHEMA_FIELDS = frozenset(
+    {
+        "board",
+        "task_id",
+        "run_id",
+        "parent_task_ids",
+        "profile/role",
+        "model",
+        "provider",
+        "key_id",
+        "call_class",
+        "handoff_id",
+        "worktree/branch",
+        "trace_id",
+        "repo",
+        "agent_run_id",
+        "correlation_id",
+        "idempotency_key",
+        "deal_id",
+        "worker_id",
+        "model_ref",
+        "trigger_type",
+        "runtime_environment",
+        "basis_fingerprint",
+        "worker_definition_version",
+        "output_schema_version",
+        "harness_task_id",
+        "harness_run_id",
+    }
+)
+
+#: Non-null string fields additionally REQUIRED on Turnstone-originated events.
+_TURNSTONE_REQUIRED = (
+    "agent_run_id",
+    "correlation_id",
+    "idempotency_key",
+    "deal_id",
+    "worker_id",
+    "model_ref",
+    "trigger_type",
+    "runtime_environment",
+    "basis_fingerprint",
+    "worker_definition_version",
+    "output_schema_version",
+    "harness_task_id",
+    "harness_run_id",
+)
+
+#: Extension fields that must be null on harness-originated (non-Turnstone)
+#: events when present.
+_NULLABLE_EXTENSIONS = _TURNSTONE_REQUIRED
+
+#: Non-empty-string base fields of the pinned schema (handoff_id is str|None).
+_STR_BASE_FIELDS = (
+    "board",
+    "task_id",
+    "profile/role",
+    "model",
+    "provider",
+    "key_id",
+    "worktree/branch",
+    "trace_id",
+)
+
+ENVELOPE_CALL_CLASSES = frozenset({"primary", "fallback", "aux", "delegate", "judge", "cron"})
+
+#: Secret-shaped string patterns (credential materials must never appear in an
+#: already-redacted metadata envelope). Matched against EVERY string value in
+#: the envelope, at any depth.
+_SECRET_SHAPED_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"\bsk-[A-Za-z0-9_-]{16,}",  # OpenAI-style API keys
+        r"\bgh[pousr]_[A-Za-z0-9]{20,}",  # GitHub tokens
+        r"\bAKIA[0-9A-Z]{16}\b",  # AWS access key ids
+        r"\bxox[baprs]-[A-Za-z0-9-]{10,}",  # Slack tokens
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----",  # PEM private key blocks
+        r"\bBearer [A-Za-z0-9\-._~+/]{16,}",  # raw bearer credentials
+    )
+)
+
+#: Explicit content sentinels: if one of these markers survives into any field,
+#: the caller put prompt/response/file CONTENT into the envelope instead of
+#: redacting it down to metadata — reject before journaling.
+_CONTENT_SENTINEL_MARKERS = ("PROMPT_TEXT", "RESPONSE_TEXT", "FILE_CONTENT")
+
+
+def _iter_string_values(value: object) -> Iterator[tuple[str, str]]:
+    """Yield (path, string) for every string reachable inside ``value``."""
+    if isinstance(value, str):
+        yield "", value
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(key, str):
+                yield key, key
+            yield from _iter_string_values(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            yield from _iter_string_values(item)
+
+
+def _redaction_violations(envelope: dict) -> list[str]:
+    """Banned-content scan: secret-shaped strings and content sentinels in any
+    field of the (allegedly already-redacted) envelope."""
+    violations: list[str] = []
+    for path, s in _iter_string_values(envelope):
+        for marker in _CONTENT_SENTINEL_MARKERS:
+            if marker.lower() in s.lower():
+                violations.append(f"content sentinel {marker!r} in field value at {path!r}")
+        for pattern in _SECRET_SHAPED_PATTERNS:
+            if pattern.search(s):
+                violations.append(f"secret-shaped string (pattern {pattern.pattern!r}) at {path!r}")
+    return violations
+
+
+def _validate_envelope_shape(envelope: dict) -> None:
+    """Enforce the pinned correlation-envelope v1.0.0 shape (metadata-only
+    boundary) BEFORE journal append. Raises ValueError on any violation.
+
+    This is the concrete enforcement of the already-redacted-envelope
+    precondition: an envelope that does not conform to the pinned metadata
+    schema, or that carries secret-shaped or content-sentinel strings, is
+    rejected — it is never journaled, never delivered.
+    """
+    violations: list[str] = []
+    unknown = sorted(set(envelope) - ENVELOPE_SCHEMA_FIELDS)
+    if unknown:
+        violations = (
+            f"unknown field(s) {unknown} (schema v1.0.0 allows only the pinned property set)"
+        )
+        raise ValueError(f"envelope rejected before journal append: {violations}")
+    for field in ENVELOPE_BASE_FIELDS:
+        if field not in envelope:
+            violations.append(f"missing required base field {field!r}")
+    for field in _STR_BASE_FIELDS:
+        val = envelope.get(field)
+        if field in envelope and (not isinstance(val, str) or not val):
+            violations.append(f"field {field!r} must be a non-empty string, got {val!r}")
+    run_id = envelope.get("run_id")
+    if "run_id" in envelope and (
+        isinstance(run_id, bool)
+        or not (isinstance(run_id, int) or (isinstance(run_id, str) and run_id))
+    ):
+        violations.append(f"field run_id must be int or non-empty str, got {run_id!r}")
+    parent_ids = envelope.get("parent_task_ids")
+    if "parent_task_ids" in envelope and (
+        not isinstance(parent_ids, list)
+        or not all(isinstance(x, str) for x in parent_ids)
+        or len(set(parent_ids)) != len(parent_ids)
+    ):
+        violations.append(
+            f"field parent_task_ids must be a list of unique strings, got {parent_ids!r}"
+        )
+    call_class = envelope.get("call_class")
+    if "call_class" in envelope and (
+        not isinstance(call_class, str) or call_class not in ENVELOPE_CALL_CLASSES
+    ):
+        violations.append(
+            f"field call_class not in {sorted(ENVELOPE_CALL_CLASSES)}: {call_class!r}"
+        )
+    handoff_id = envelope.get("handoff_id")
+    if (
+        "handoff_id" in envelope
+        and handoff_id is not None
+        and (not isinstance(handoff_id, str) or not handoff_id)
+    ):
+        violations.append(f"field handoff_id must be str or null, got {handoff_id!r}")
+    repo = envelope.get("repo")
+    if repo == "turnstone":
+        for req in _TURNSTONE_REQUIRED:
+            val = envelope.get(req)
+            if req == "runtime_environment":
+                if val not in ("dev", "staging", "production"):
+                    violations.append(
+                        f"Turnstone event: runtime_environment must be "
+                        f"dev/staging/production, got {val!r}"
+                    )
+            elif not isinstance(req_val := envelope.get(req), str) or not req_val:
+                violations.append(f"Turnstone event: field {req!r} must be a non-empty string")
+    else:
+        for req in _NULLABLE_EXTENSIONS:
+            if req in envelope and envelope[req] is not None:
+                violations.append(
+                    f"non-Turnstone event: extension field {req!r} must be null/absent"
+                )
+        ht, hr = envelope.get("harness_task_id"), envelope.get("harness_run_id")
+        if (isinstance(ht, str) and ht) != (isinstance(hr, str) and hr):
+            violations.append("harness_task_id and harness_run_id must be carried together")
+    violations.extend(_redaction_violations(envelope))
+    if violations:
+        raise ValueError(
+            "envelope rejected before journal append (metadata-only boundary): "
+            + "; ".join(violations)
+        )
 
 
 def _utcnow_iso() -> str:
@@ -335,16 +559,17 @@ class Transport:
     # ------------------------------------------------------------------
 
     def enqueue(self, envelope: dict) -> dict:
-        """Durably journal an already-redacted envelope; return the receipt."""
+        """Validate, then durably journal an already-redacted envelope; return
+        the receipt.
+
+        Enforces the metadata-only/schema boundary BEFORE journal append
+        (R-OBS-00 v1.0.0 shape + banned-content scan): an envelope that fails
+        the pinned schema shape, or carries secret-shaped / content-sentinel
+        strings, raises ValueError and is never journaled.
+        """
         if not isinstance(envelope, dict):
             raise TypeError("enqueue expects an envelope dict (redaction runs before enqueue)")
-        missing = [f for f in ENVELOPE_BASE_FIELDS if f not in envelope]
-        if missing:
-            logger.warning(
-                "transport: envelope missing base field(s) %s — journaling anyway "
-                "(fail-closed; fix at the emitter)",
-                missing,
-            )
+        _validate_envelope_shape(envelope)
         event_id = "evt_" + uuid.uuid4().hex
         enqueued_at = _utcnow_iso()
         record = {"event_id": event_id, "enqueued_at": enqueued_at, "envelope": envelope}
@@ -401,17 +626,54 @@ class Transport:
             result = self.sink.deliver(payload)
         except Exception as exc:  # noqa: BLE001 — fail-closed: any sink failure is an outage
             return {"ok": False, "accepted": 0, "detail": f"{type(exc).__name__}: {exc}"}
-        if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
-            return {"ok": False, "accepted": 0, "detail": f"non-conforming sink result: {result!r}"}
-        accepted = result.get("accepted", len(batch) if result["ok"] else 0)
-        if not isinstance(accepted, int) or accepted < 0:
-            return {"ok": False, "accepted": 0, "detail": f"invalid accepted count: {accepted!r}"}
-        accepted = min(accepted, len(batch))
-        return {
-            "ok": bool(result["ok"]),
-            "accepted": accepted,
-            "detail": str(result.get("detail", "")),
-        }
+        # STRICT exact validation of the pinned sink-result contract. A
+        # non-conforming result is a failed attempt: the cursor is NEVER
+        # advanced on this path (a missing `accepted` must never be silently
+        # defaulted to a full-batch acceptance — that silently loses events).
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "accepted": 0,
+                "detail": f"non-conforming sink result (not a dict): {result!r}",
+            }
+        missing = [key for key in ("ok", "accepted", "detail") if key not in result]
+        if missing:
+            return {
+                "ok": False,
+                "accepted": 0,
+                "detail": f"non-conforming sink result: missing field(s) {missing}: {result!r}",
+            }
+        ok = result["ok"]
+        if type(ok) is not bool:
+            return {
+                "ok": False,
+                "accepted": 0,
+                "detail": f"non-conforming sink result: ok must be bool, got {type(ok).__name__}",
+            }
+        accepted = result["accepted"]
+        # type() not isinstance(): bool is a subclass of int and True/False are
+        # not valid counts; accepted beyond len(batch) means the sink claims
+        # durability it cannot have — reject rather than clamp silently.
+        if type(accepted) is not int:
+            return {
+                "ok": False,
+                "accepted": 0,
+                "detail": f"invalid accepted count (must be int): {accepted!r}",
+            }
+        if accepted < 0 or accepted > len(batch):
+            return {
+                "ok": False,
+                "accepted": 0,
+                "detail": f"invalid accepted count (out of range 0..{len(batch)}): {accepted!r}",
+            }
+        detail = result["detail"]
+        if not isinstance(detail, str):
+            return {
+                "ok": False,
+                "accepted": 0,
+                "detail": f"non-conforming sink result: detail must be str, got {detail!r}",
+            }
+        return {"ok": ok, "accepted": accepted, "detail": detail}
 
     def _oldest_pending_age(self) -> float:
         pending = self._journaled - int(self._state["delivered_count"])
@@ -480,6 +742,8 @@ class Transport:
         delivered_total = 0
         attempts_used = 0
         last_detail = ""
+        last_ok = False
+        partial = False
         attempt = 0
         while True:
             with self._lock:
@@ -495,6 +759,7 @@ class Transport:
             attempts_used = attempt
             result = self._attempt_deliver(batch, attempt)
             last_detail = result["detail"]
+            last_ok = result["ok"]
             if result["ok"] and result["accepted"] > 0:
                 accepted = result["accepted"]
                 with self._lock:
@@ -508,6 +773,7 @@ class Transport:
                     # Partial accept: only the accepted prefix is durable at the
                     # sink; the remainder is requeued and left pending for the
                     # next flush (never dropped, never double-counted).
+                    partial = True
                     break
                 attempt = 0  # a success resets the retry budget for the next batch
                 continue
@@ -520,6 +786,18 @@ class Transport:
                 self._open_outage("sink_unavailable", last_detail)
             self._sleep(min(self.max_delay_s, self.base_delay_s * (2 ** (attempt - 1))))
         pending = self._journaled - int(self._state["delivered_count"])
+        if pending > 0 and self._state.get("open_episode") is None:
+            # Fail-closed invariant (module docstring §3): EVERY flush that
+            # ends with pending records must durably open/update the outage
+            # ledger — including one-attempt failure (max_retries=1),
+            # ok-but-nothing-accepted, and partial accept. No silent outage.
+            if partial:
+                kind = "partial_accept_pending"
+            elif last_ok:
+                kind = "sink_accepted_none"
+            else:
+                kind = "sink_unavailable"
+            self._open_outage(kind, last_detail or "flush ended with pending records")
         return {
             "ok": pending == 0,
             "attempts": attempts_used,
