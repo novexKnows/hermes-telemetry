@@ -25,18 +25,24 @@ partial-accept semantics. Inside the envelope, the exporter forwards the
 envelope values as-is — redaction already happened upstream (B1); the
 exporter adds no fields and has no API to add prompt/response/file content.
 
-FAIL-CLOSED PRE-SEND LEAKAGE GATE (R-OBS-00 defense in depth): before any
-POST, every string in the ACTUAL outbound payload (envelope values included)
-has its Unicode default-ignorable characters (Cf/Zl/Zp categories plus known
-outliers — the same strip B1's redaction.py applies before ITS matching)
-stripped, and the normalized form is matched against sentinel-marker and
-secret-shape patterns. This defeats obfuscation like U+2063 interleaved into
-a banned marker inside an allowed envelope value: the plain value would
-survive verbatim forwarding and only normalization recovers the marker. On a
-hit the event is REJECTED (no POST occurs, the in-order prefix stops) and
-the violation names only the payload location — never the value. Clean
-strings are delivered with ignorables already stripped (nothing invisible
-survives to the vendor).
+NEVER-EXPORT GATE (fail-closed, pre-send; union of the B4a and B4b lanes):
+before any transport call, the exporter strips Unicode default-ignorable
+characters (Cf/Zl/Zp + outliers — mirroring B1's ``redaction.py``, shared
+helper ``_strip_default_ignorables``) from the ENTIRE outbound payload
+(envelope values and JSON keys alike) and matches the normalized form — the
+exact form that is sent — against the never-export sentinels (the six
+``SENTINEL-*`` markers, the case-insensitive ``SENTINEL-`` prefix, and the
+secret-shape patterns mirrored from B1 redaction.py: sk-…, ghp_…, AKIA…,
+xox…, Bearer tokens, private-key blocks, credential-embedding URLs). This
+defeats obfuscation like U+2063 interleaved into a banned marker inside an
+allowed envelope value: the plain value would survive verbatim forwarding
+and only normalization recovers it. On a hit the event is REJECTED with
+ZERO transport calls (no POST occurs, the in-order prefix stops) and the
+rejection names only an OPAQUE structural location (role + positional
+``path.key[i]`` path — never mapping key text, never the matched value,
+never the sentinel text). Clean strings are delivered with ignorables
+already stripped (nothing invisible survives to the vendor): what the gate
+verified is exactly what reaches the network.
 
 Dedupe: like B3's ``LocalFileSink``, a duplicate ``event_id`` counts as
 accepted but is not re-transmitted. Server-side, LangSmith keeps exactly ONE
@@ -90,6 +96,21 @@ __all__ = [
 PINNED_EVENT_KEYS = frozenset({"event_id", "enqueued_at", "attempt", "envelope"})
 
 
+#: Never-export sentinels (telemetry-contract.md §3.3): if any of these
+#: survives into an outbound payload, non-metadata content reached the
+#: exporter. Matched against the Unicode-normalized payload (see
+#: ``_never_export_violation``); a hit rejects the event with zero transport
+#: calls. Never logged or echoed — not even the marker text.
+_NEVER_EXPORT_MARKERS = (
+    "SENTINEL-PROMPT-TEXT",
+    "SENTINEL-RESPONSE-TEXT",
+    "SENTINEL-TOOL-RESULT-BODY",
+    "SENTINEL-SECRET-VALUE",
+    "SENTINEL-ENV-VALUE",
+    "SENTINEL-FILE-CONTENT",
+)
+
+
 class Sink:
     """Pinned sink interface — B4 exporters implement ``deliver`` exactly."""
 
@@ -110,6 +131,134 @@ def langsmith_run_id_for_event(event_id: str) -> str:
     behaviour.
     """
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"hermes-telemetry:event:{event_id}"))
+
+
+# ---------------------------------------------------------------------------
+# Never-export gate (fail-closed, pre-send). Defense in depth on top of B1's
+# upstream redaction: an exporter must not transmit never-export material even
+# if an upstream layer misses it. Two steps, in this exact order:
+#
+#   1. STRIP Unicode default-ignorable characters (mirrors B1
+#      ``redaction.py`` — same category set + outliers; helper named
+#      ``_strip_default_ignorables`` identically so the lanes align). These
+#      code points are invisible but are part of the string, so a sentinel
+#      interleaved with them (e.g. U+200B inside ``SENTINEL-SECRET-VALUE``)
+#      would otherwise defeat plain matching and reach the wire verbatim.
+#      The normalized form is what the transport SENDS — nothing ignorable
+#      survives to the network.
+#   2. MATCH the normalized payload against the never-export sentinels. Any
+#      hit REJECTS the event before a single transport call is made (zero
+#      network I/O). The rejection detail names an OPAQUE structural location
+#      only — never the matched value, never the sentinel text, and never
+#      mapping key text (raw or normalized): keys are attacker-controlled,
+#      so echoing them into ``detail`` would leak banned material even with
+#      zero transport calls (R4b2 round-3 finding). The match is the union of
+#      the two lanes' gates (B4a + B4b): the six markers below, the
+#      case-insensitive ``SENTINEL-`` prefix, and the secret-shape patterns
+#      mirrored from B1 redaction.py (``_banned_material``).
+# ---------------------------------------------------------------------------
+
+_DEFAULT_IGNORABLE_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+
+_EXTRA_DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn)
+    (0x115F, 0x1160),  # HANGUL JUNGSEONG/JONGSEONG FILLER (Lo)
+    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ/AA (Mn)
+    (0x180B, 0x180D),  # MONGOLIAN FREE VARIATION SELECTOR ONE-THREE (Mn)
+    (0xFE00, 0xFE0F),  # VARIATION SELECTOR-1..16 (Mn)
+    (0x2065, 0x2065),  # unassigned, default-ignorable (Cn)
+    (0x3164, 0x3164),  # HANGUL FILLER (Lo)
+    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo)
+    (0xFFF0, 0xFFF8),  # unassigned, default-ignorable (Cn)
+    (0xE0000, 0xE0FFF),  # tag characters / variation selectors supplement (Cn)
+)
+
+
+def _is_default_ignorable(ch: str) -> bool:
+    if unicodedata.category(ch) in _DEFAULT_IGNORABLE_CATEGORIES:
+        return True
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _EXTRA_DEFAULT_IGNORABLE_RANGES)
+
+
+def _strip_default_ignorables(value: str) -> str:
+    """Remove every Unicode default-ignorable character from ``value``."""
+    if not value:
+        return value
+    return "".join(ch for ch in value if not _is_default_ignorable(ch))
+
+
+def _normalized(value: object) -> object:
+    """Deep copy of ``value`` with every string (key or value) stripped of
+    Unicode default-ignorable characters.
+
+    This is the exact form the gate scans AND the form the exporter sends,
+    so what is verified is what goes on the wire.
+    """
+    if isinstance(value, str):
+        return _strip_default_ignorables(value)
+    if isinstance(value, dict):
+        return {_normalized(k): _normalized(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalized(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_normalized(item) for item in value)
+    return value
+
+
+def _iter_string_values(value: object, path: str = "payload"):
+    """Yield ``(path, role, string)`` for every string reachable inside ``value``.
+
+    ``path`` is STRUCTURAL and OPAQUE: it is built from container shape only
+    (``.key[i]`` / ``[i]`` positions) and NEVER contains mapping key text —
+    keys are attacker-controlled, so neither their raw nor their normalized
+    form may ever be echoed into a rejection ``detail``. ``role`` says whether
+    the matched string was a mapping key or a value.
+    """
+    if isinstance(value, str):
+        yield path, "value", value
+    elif isinstance(value, dict):
+        for i, (key, item) in enumerate(value.items()):
+            key_path = f"{path}.key[{i}]"
+            if isinstance(key, str):
+                yield key_path, "key", key
+            yield from _iter_string_values(item, key_path)
+    elif isinstance(value, (list, tuple)):
+        for i, item in enumerate(value):
+            yield from _iter_string_values(item, f"{path}[{i}]")
+
+
+def _never_export_violation(payload: dict) -> str | None:
+    """First never-export hit in the (already normalized) payload, or None.
+
+    Matching is the union of the two lanes' gates: the six ``SENTINEL-*``
+    never-export markers (case-insensitive substrings), the case-insensitive
+    ``SENTINEL-`` marker prefix, and the secret-shape patterns mirrored from
+    B1 redaction.py (``_banned_material``).
+
+    The violation string names only an OPAQUE structural location (``role`` +
+    positional path) — never the matched value, never the sentinel text (a
+    direct hit's "value" IS the sentinel), and never mapping key text (raw or
+    normalized — attacker-controlled by definition).
+    """
+    for path, role, s in _iter_string_values(payload):
+        lowered = s.lower()
+        for marker in _NEVER_EXPORT_MARKERS:
+            if marker.lower() in lowered:
+                return (
+                    f"never-export gate: banned marker matched in a {role} at "
+                    f"{path} (contents withheld; nothing transmitted)"
+                )
+        # Secret shapes (union of the B4a lane's gate): synthetic-looking keys,
+        # bearer tokens, private-key blocks, credential-embedding URLs — any
+        # of these in an outbound payload is never-export material even when
+        # no SENTINEL-* marker is present.
+        if _banned_material(s):
+            return (
+                f"never-export gate: banned material matched in a {role} at "
+                f"{path} (contents withheld; nothing transmitted)"
+            )
+    return None
 
 
 def _extract(event: dict) -> tuple[str | None, str | None, dict | None, str | None]:
@@ -147,47 +296,6 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ---------------------------------------------------------------------------
-# Fail-closed pre-send leakage gate. Mirrors B1 redaction.py's normalization
-# (strip default-ignorables BEFORE matching) so the sink's last-line gate is
-# never weaker than the emitter's scrubber: Unicode default-ignorable code
-# points are invisible in display but ARE part of the string value, so an
-# attacker can interleave them into banned material inside an allowed
-# envelope value (e.g. U+2063 inside SENTINEL-SECRET-VALUE) to defeat plain
-# substring matching. The strip runs over the ACTUAL outbound payload, the
-# normalized form is matched, and a hit rejects the event with no POST.
-# ---------------------------------------------------------------------------
-
-_DEFAULT_IGNORABLE_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
-
-_EXTRA_DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
-    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn)
-    (0x115F, 0x1160),  # HANGUL JUNGSEONG/JONGSEONG FILLER (Lo)
-    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ/AA (Mn)
-    (0x180B, 0x180D),  # MONGOLIAN FREE VARIATION SELECTOR ONE-THREE (Mn)
-    (0xFE00, 0xFE0F),  # VARIATION SELECTOR-1..16 (Mn)
-    (0x2065, 0x2065),  # unassigned, default-ignorable (Cn)
-    (0x3164, 0x3164),  # HANGUL FILLER (Lo)
-    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo)
-    (0xFFF0, 0xFFF8),  # unassigned, default-ignorable (Cn)
-    (0xE0000, 0xE0FFF),  # tag characters / variation selectors supplement (Cn)
-)
-
-
-def _is_default_ignorable(ch: str) -> bool:
-    if unicodedata.category(ch) in _DEFAULT_IGNORABLE_CATEGORIES:
-        return True
-    cp = ord(ch)
-    return any(lo <= cp <= hi for lo, hi in _EXTRA_DEFAULT_IGNORABLE_RANGES)
-
-
-def _strip_default_ignorables(value: str) -> str:
-    """Remove every Unicode default-ignorable character from ``value``."""
-    if not value:
-        return value
-    return "".join(ch for ch in value if not _is_default_ignorable(ch))
-
-
 # Sentinel-marker prefix (contract §3.3 redaction-leakage scan markers, e.g.
 # SENTINEL-SECRET-VALUE) matched case-insensitively, plus the secret-shape
 # patterns mirrored from B1 redaction.py (conservative: must not false-positive
@@ -222,52 +330,6 @@ def _banned_material(normalized: str) -> bool:
     if _SENTINEL_MARK_RE.search(normalized):
         return True
     return any(pattern.search(normalized) for pattern in _SECRET_SHAPE_RES)
-
-
-def _normalize_outbound(node: object, path: str) -> tuple[object, str | None]:
-    """Normalize one outbound-payload node; return ``(normalized, violation)``.
-
-    Every string (value or JSON key) has its default-ignorable characters
-    stripped, and the normalized form is matched against sentinel/secret
-    shapes. ``violation`` is non-None on a hit — the caller must reject the
-    event without any POST and must never echo the offending value. Keys are
-    normalized too: they ride in the outbound JSON exactly like values.
-
-    Key locations in ``violation`` are opaque: because the raw (or even the
-    normalized) key text is attacker-controlled, it is never interpolated
-    into the detail path — positional ``key[i]`` labels are used instead
-    (R4a2: an obfuscated banned key must not be echoed back in detail).
-    """
-    if isinstance(node, dict):
-        normalized: dict = {}
-        for index, (key, value) in enumerate(node.items()):
-            # Opaque key location: report ``path.key[i]``, never the key text.
-            child_path = f"{path}.key[{index}]"
-            if isinstance(key, str):
-                plain_key = _strip_default_ignorables(key)
-                if _banned_material(plain_key):
-                    return None, f"banned material at {child_path} (key; value withheld)"
-            else:
-                plain_key = key
-            clean, violation = _normalize_outbound(value, child_path)
-            if violation:
-                return None, violation
-            normalized[plain_key] = clean
-        return normalized, None
-    if isinstance(node, list):
-        cleaned = []
-        for index, item in enumerate(node):
-            clean, violation = _normalize_outbound(item, f"{path}[{index}]")
-            if violation:
-                return None, violation
-            cleaned.append(clean)
-        return cleaned, None
-    if isinstance(node, str):
-        plain = _strip_default_ignorables(node)
-        if _banned_material(plain):
-            return None, f"banned material at {path} (value withheld)"
-        return plain, None
-    return node, None
 
 
 def _default_post(url: str, body: dict, headers: dict, timeout: float) -> int:
@@ -321,9 +383,10 @@ class LangSmithExporter(Sink):
     """Metadata-only R-OBS-00 envelope exporter to a LangSmith project.
 
     One journal record -> one finished LangSmith run (trace root, ``run_type``
-    ``"tool"``). Contract §1.6 mapping: the envelope is attached VERBATIM as
-    the run's ``extra.metadata`` — JSON keys with ``/`` (``profile/role``,
-    ``worktree/branch``) are legal in LangSmith metadata. ``inputs``/``outputs``
+    ``"tool"``). Contract §1.6 mapping: the envelope is attached as the run's
+    ``extra.metadata`` in Unicode-normalized form (never-export gate — §1.6
+    notes JSON keys with ``/`` (``profile/role``, ``worktree/branch``) are
+    legal in LangSmith metadata). ``inputs``/``outputs``
     are empty dicts (metadata-only: no prompt, response or file content ever).
 
     Tenant scoping: the LangSmith API cannot resolve the workspace from the
@@ -437,11 +500,13 @@ class LangSmithExporter(Sink):
             "error": None,
             "extra": {"metadata": metadata},
         }
-        # Pre-send gate over the ACTUAL outbound payload (docstring: fail-closed
-        # leakage gate). Normalize first, match second; a hit rejects the event.
-        payload, leak_violation = _normalize_outbound(payload, "payload")
-        if leak_violation:
-            return {}, leak_violation
+        # Never-export gate (fail-closed, pre-send): normalize then scan the
+        # exact payload that would be transmitted; a hit means ZERO transport
+        # calls and a rejection whose detail never carries the banned value.
+        payload = _normalized(payload)
+        violation = _never_export_violation(payload)
+        if violation:
+            return {}, violation
         return payload, None
 
     def deliver(self, events: list[dict]) -> dict:
@@ -531,13 +596,16 @@ class SentryExporter(Sink):
     One journal record -> one Sentry event with the envelope attached as TAGS
     (contract §1.6: ``/`` in tag keys normalized to ``_``; non-string values
     serialized as strings) plus an ``extra`` metadata block carrying the
-    envelope verbatim. Credential: ``SENTRY_DSN`` env var (§3.4) — the store
+    Unicode-normalized envelope (never-export gate). Credential:
+    ``SENTRY_DSN`` env var (§3.4) — the store
     endpoint derives from the DSN itself, never a separate host config.
 
-    VERIFICATION STATUS (HTB-B4): the LangSmith leg is verified end-to-end
-    against the live sandbox; the Sentry leg is credential-gated (no
-    SENTRY_DSN provisioned), so this exporter is mock-tested only and its
-    integration test skips without a DSN. ``sentry_verified`` is NOT claimed.
+    VERIFICATION STATUS (HTB-B4b): VERIFIED live end-to-end. Sandbox project
+    ``sovav-hermes-sandbox`` (org ``sovav``), real store-endpoint ingestion of
+    metadata-only envelopes, and authenticated API read-back per event — see
+    ``docs/telemetry/sandbox-flow.md`` for commands and evidence. The
+    integration tests below run the same flow skip-gated on ``SENTRY_DSN`` +
+    ``SENTRY_AUTH_TOKEN``.
     """
 
     DEFAULT_ENV_DSN = "SENTRY_DSN"
@@ -583,6 +651,13 @@ class SentryExporter(Sink):
             "tags": tags,
             "extra": {"envelope": envelope, "enqueued_at": enqueued_at},
         }
+        # Never-export gate (fail-closed, pre-send): normalize then scan the
+        # exact payload that would be transmitted; a hit means ZERO transport
+        # calls and a rejection whose detail never carries the banned value.
+        payload = _normalized(payload)
+        violation = _never_export_violation(payload)
+        if violation:
+            return {}, violation
         return payload, None
 
     def _store_url(self) -> str:

@@ -1,11 +1,13 @@
-# Sandbox telemetry flow — LangSmith (+ Sentry) exporters (HTB-B4)
+# Sandbox telemetry flow — LangSmith (+ Sentry) exporters (HTB-B4 / B4b)
 
-Status: **LangSmith leg VERIFIED end-to-end (live)** — the auth blocker was a
-tenant-scoping gap, not a bad credential (resolution and evidence below); real
-metadata-only ingestion into the sandbox project and SDK read-back both work
-unattended. The Sentry leg remains credential-gated (no SENTRY_DSN). Nothing
-in this flow is fabricated: every claim of "verified" below is backed by a
-command and its real output.
+Status (2026-09-19, merged lanes B4a + B4b): **Sentry + Seer legs VERIFIED
+live end-to-end** (lane B4b); the LangSmith leg is recorded by lane B4a as
+**VERIFIED end-to-end (live)** — the auth blocker was a tenant-scoping gap,
+not a bad credential (resolution and evidence below) — while lane B4b's
+correction rerun still saw the provisioned credential rejected by the live
+API (its evidence is preserved below; both lane records are kept as
+written, with attribution). Nothing in this flow is fabricated: every
+claim of "verified" below is backed by a command and its real output.
 
 ## Contract pins (unchanged)
 
@@ -97,6 +99,180 @@ runs the marker scan over the round-tripped run. Re-runs are idempotent: the
 re-POST of an already-received run id gets 409, which counts as
 accepted-duplicate.
 
+## Sentry + Seer live flow (HTB-B4b) — VERIFIED 2026-09-19
+
+### Provisioning (authenticated API metadata only — nothing guessed)
+
+Org resolved via `GET /api/0/organizations/` with the personal token: exactly
+one org, `sovav` (id `4512063704989696`). Zero pre-existing projects. Sandbox
+project created per Trevor's authorization:
+```
+POST /api/0/organizations/sovav/projects/  {"name": "sovav-hermes-sandbox", "platform": "python"}
+-> HTTP 201, project id 4512113840685056, slug sovav-hermes-sandbox
+```
+
+DSN obtained from the project's single client key:
+
+```
+GET /api/0/projects/sovav/sovav-hermes-sandbox/keys/  -> 1 key "Default"
+DSN ingest host: o4512063704989696.ingest.us.sentry.io   # host name only, not a secret
+```
+
+Token topology (names only): `C:/svc/secrets/sentry-personal-token.txt` is a
+user auth token (`sntryu_`-family) — full API read access, used for
+provisioning/read-back. `C:/svc/secrets/sentry-org-token.txt` (`sntrys_`-family)
+authenticates (HTTP 200 on `GET /api/0/`) but is 403 on org/project listing
+(scoped narrower than org read) — unused; least privilege.
+
+### Ingestion + read-back (the verified loop)
+
+Env vars (names): `SENTRY_DSN` (store credential), `SENTRY_AUTH_TOKEN` (API
+read-back), `SENTRY_ORG` (`sovav`), `SENTRY_PROJECT` (`sovav-hermes-sandbox`).
+
+```
+export SENTRY_DSN=...            # from the keys endpoint above, never inline in code
+export SENTRY_AUTH_TOKEN=...     # personal token file contents
+python -m pytest tests/test_sinks.py -k "integration and sentry" -v
+```
+
+Verified live, in this order:
+
+1. `SentryExporter.deliver()` posted 3 metadata-only synthetic envelopes to the
+   DSN-derived store endpoint
+   `https://o4512063704989696.ingest.us.sentry.io/api/4512113840685056/store/`
+   (X-Sentry-Auth store protocol from the DSN's public key) — result
+   `{"ok": true, "accepted": 3, "detail": "sentry[4512113840685056]: accepted 3, deduped 0"}`.
+2. Read-back via `GET /api/0/projects/sovav/sovav-hermes-sandbox/events/{event_id}/`
+   with `Authorization: Bearer $SENTRY_AUTH_TOKEN`. Caveat observed, not
+   assumed: the per-event GET returned 404 immediately after ingest
+   (asynchronous ingest processing) and HTTP 200 for all 3 events after ~60s —
+   the integration test therefore polls (deadline 120s, 10s interval).
+3. Read-back payloads carry the envelope round-tripped: tags
+   `profile_role=worker`, `worktree_branch=wt/htb-b4b`, `task_id=t_e3985496`,
+   `trace_id=trc_htb4b_0002`, `run_id=22`, `event_id=ev-000N`, plus
+   `context.envelope` verbatim (slash keys preserved) and `context.enqueued_at`.
+   The §3.3 sentinel-marker scan over the real read-back JSON: no hits.
+
+Sentry event ids read back (deterministic uuid5 of the transport event ids):
+`67c3e37029315df9b5434da35e08bdc9`, `85242506802258088112298b07ab7930`,
+`bf1cbb73a50e5c04bafdf2d63e85a8c9`.
+
+> R4b correction note: the event ids above belong to the ORIGINAL 16:04Z run.
+> From the R4b correction onward (see next section), integration tests
+> generate UNIQUE event/trace/handoff ids per run, so a read-back can only
+> ever succeed against objects ingested by that run — fixed ids proved old
+> objects, not fresh ingestion.
+
+### Correction re-verification (R4b, 2026-09-19, commit range e3586c0..htb-b4b)
+
+Two fixes re-verified LIVE against the same sandbox project/DSN (org `sovav`,
+project id `4512113840685056`; no other project exists on the token):
+
+1. Never-export gate (fail-closed, pre-send, both exporters): `sinks.py` now
+   strips Unicode default-ignorable characters (Cf/Zl/Zp + outliers — the
+   same set as B1's `redaction.py`, shared helper `_strip_default_ignorables`)
+   from the ENTIRE outbound payload before never-export sentinel matching.
+   A hit (direct or obfuscated, e.g. `SENTINEL-SECRET<U+200B>-VALUE` in the
+   schema-allowed `model` field) rejects the event with ZERO transport calls;
+   `detail` names the field path only — never the rejected value. Clean
+   values travel in the normalized (stripped) form. Unit probes cover direct,
+   case-normalized, U+200B, U+2063, U+E0020 tag-char and U+180E variants for
+   BOTH exporters plus benign-ignorable positives (14 tests).
+2. Fresh-ID integration proof: all three integration legs (Sentry e2e,
+   Sentry metadata-only scan, Seer loop) now use per-run unique
+   event/trace/handoff ids, poll/read back THAT exact event, and join Seer by
+   the fresh event's own `groupID` (from the authenticated per-event
+   read-back) — never by the shared title. The Seer summarize call pins the
+   event via the endpoint's `force_event_id` (POST body `{"event_id": ...}`,
+   verified against live getsentry `src/sentry/seer/endpoints/
+   group_ai_summary.py` + `src/sentry/seer/autofix/issue_summary.py`: forced
+   events always generate a new summary and the response's `eventId` names
+   it); the test asserts the returned analysis carries the fresh id.
+
+Fresh evidence from the correction run (ids unique per run; created
+2026-09-19T16:44:21Z, i.e. AFTER the R4b review rerun at 16:15Z):
+
+- deliver: `{"ok": true, "accepted": 1, "detail": "sentry[4512113840685056]: accepted 1, deduped 0"}`
+- read-back: HTTP 200, `eventID d9aa3415097155f8a9be0036cf068be6`,
+  `groupID 7742538801`, tags round-trip `event_id=ev-41afed869cad`,
+  `trace_id=trc-78bf59bd`, `handoff_id=hnd-413593cc21db` (non-null),
+  `task_id=t_e246539f`, `run_id=28`.
+- summarize (forced to the fresh event): HTTP 200, response `eventId`
+  `d9aa3415097155f8a9be0036cf068be6` — the fresh id, not an older sibling.
+- autofix: HTTP 409 `repos_not_linked` (unchanged gap — needs repo
+  integration + code mapping, org-level, not attempted per least privilege).
+
+Commands (values never printed; DSN fetched from the authenticated keys
+endpoint at runtime):
+
+```
+export SENTRY_AUTH_TOKEN="$(tr -d ' \r\n' < /c/svc/secrets/sentry-personal-token.txt)"
+export SENTRY_ORG=sovav SENTRY_PROJECT=sovav-hermes-sandbox
+export SENTRY_DSN="$(curl -s -H "Authorization: Bearer $SENTRY_AUTH_TOKEN" \
+  https://sentry.io/api/0/projects/$SENTRY_ORG/$SENTRY_PROJECT/keys/ \
+  | python -c "import json,sys;print(json.load(sys.stdin)[0]['dsn']['public'])")"
+python -m pytest tests/test_sinks.py -k "integration and sentry" -v
+python -m pytest tests/test_seer.py -k integration -v
+```
+
+### Seer (verified summary loop; autofix run gap recorded)
+
+Endpoints pinned against live `getsentry/sentry` `src/sentry/api/urls.py`
+(master, fetched 2026-09-19) — not memory:
+
+- `GET  /organizations/sovav/seer/setup-check/` -> HTTP 200
+  `{"setupAcknowledgement": {"orgHasAcknowledged": true, "userHasAcknowledged": true}, "hasFreeAutofixAccess": false, "billing": {"hasAutofixQuota": true, "hasScannerQuota": true}}`
+- `GET  /projects/sovav/sovav-hermes-sandbox/seer/preferences/` -> HTTP 200
+  (repos `[]`, `automated_run_stopping_point: "code_changes"`)
+- Our 3 ingested events grouped into issue `7742538801`
+  (`SOVAV-HERMES-SANDBOX-1`, title = `R-OBS-00 metadata-only telemetry event`).
+- **Analysis loop VERIFIED**: `POST /organizations/sovav/issues/7742538801/summarize/`
+  -> HTTP 200 with a real Seer analysis (`headline`, `whatsWrong`,
+  `possibleCause`, `scores.possibleCauseConfidence`) referencing our event id.
+  Implemented as the usable client `seer.py::SeerClient` (stdlib-only;
+  `setup_check` / `project_preferences` / `summarize_issue` /
+  `trigger_autofix` / `autofix_status`; token via `SENTRY_AUTH_TOKEN` env name
+  only). R4b correction: `summarize_issue` accepts `event_id`, mapped to the
+  endpoint's `force_event_id` (verified against live getsentry source) —
+  without it Seer picks the event itself and returned an OLDER sibling of the
+  group; with it the response's `eventId` is exactly the event being proven.
+- **Autofix run gap (explicit)**: `POST .../autofix/` -> HTTP 409
+  `{"code": "repos_not_linked"}` — Seer autofix runs require repositories
+  connected to the project plus code mappings. No repo integration is
+  provisioned on the org; connecting one was not attempted (org-level change,
+  beyond sandbox-project least privilege). The status/read loop itself
+  (`GET .../autofix/` -> `{"autofix": null}`) is verified. Unblocking item:
+  a repo integration + code mapping for the sandbox project, or a decision to
+  run Seer analysis in summary-only mode.
+
+### Tests (skip-gated, mirroring the LangSmith pattern)
+
+- `tests/test_sinks.py`: 37 unit + 2 Sentry integration
+  (`test_integration_sentry_sandbox_end_to_end` — deliver + polled API
+  read-back of a FRESH per-run event id + tag round-trip + `dateCreated`
+  fresh-window assertion (creation timestamp >= a pre-delivery UTC bound,
+  small 5s skew allowance); `test_integration_sentry_readback_is_metadata_only`
+  — §3.3 negative scan over the real read-back payload of a fresh event,
+  same `dateCreated` bound). Unit tests include 14 never-export-gate probes:
+  direct, case-normalized and Unicode-obfuscated sentinel hits in the
+  schema-allowed `model` field rejected with ZERO transport calls for BOTH
+  exporters, plus benign-ignorable normalization positives, PLUS 4
+  key-negative probes (sentinel material used as a mapping KEY — U+2063
+  obfuscated and direct — rejected with ZERO transport calls, the rejection
+  detail carrying an opaque structural location only: raw and normalized key
+  text never echoed, either exporter).
+- `tests/test_seer.py`: 9 unit + 1 integration
+  (`test_integration_seer_sandbox_analysis_loop` — setup-check, ingest a
+  FRESH metadata-only event with per-run unique event/trace/handoff ids,
+  read back THAT exact event (with the same `dateCreated` fresh-window
+  assertion), join its issue group via the event's own
+  `groupID`, forced-event `summarize_issue` asserting the fresh id in the
+  returned analysis, §3.3 scan, `trigger_autofix` outcome surfaced without
+  asserting success).
+- Integration legs skip unless `SENTRY_DSN` + `SENTRY_AUTH_TOKEN` are present
+  in the ambient env (no-fabrication gate). Live run: `3 passed, 2 skipped`
+  (the 2 LangSmith legs skip — lane B4a credential issue, see below).
+
 ## Verification evidence
 
 ### Unit + redaction negative tests — PASS (2026-09-19)
@@ -107,13 +283,24 @@ python -m pytest tests/ -v              -> 652 passed, 1 failed (pre-existing)
 python -m pytest tests/test_sinks.py -v -> 24 passed, 3 warnings in 5.07s
 ```
 
+Lane B4a's rerun record (kept as written):
+
 The single full-suite failure
 (`tests/test_sync_profiles.py::test_plugin_status_detects_install_via_symlink`)
 is a pre-existing Windows-environment privilege error (`OSError: [WinError
 1314]` creating a symlink in tmp) — reproduced identically on the clean
 checkpoint commit e3586c0 with this lane's changes stashed. Unrelated to sinks.
 
-### LangSmith live leg — RESOLVED: tenant scoping, not a bad credential
+### LangSmith live leg — lane B4a: RESOLVED (tenant scoping, not a bad credential)
+
+Lane B4b's correction rerun record (kept as written):
+
+```
+python -m pytest tests/test_sinks.py tests/test_seer.py -q
+39 passed, 5 skipped   # pre-live; integration legs skip without creds
+```
+
+### LangSmith live leg — lane B4b's run: BLOCKED (provisioned key rejected by the live API)
 
 Method: key loaded at runtime from the approved file into env (never printed,
 never logged; only statuses, response metadata and response bodies below,
@@ -201,11 +388,18 @@ What the passing assertions prove, on real round-tripped data:
 
 ## Not done / pending
 
-- LangSmith leg: COMPLETE (auth resolved, real ingestion, SDK read-back,
-  unattended integration tests, this documentation). Nothing pending.
-- Sentry/Seer legs (credential gaps, unchanged): still needs `SENTRY_DSN` for
+- LangSmith leg (lane B4a): COMPLETE per B4a's record (auth resolved, real
+  ingestion, SDK read-back, unattended integration tests, this
+  documentation). Lane B4b's correction rerun still saw the provisioned
+  credential rejected by the live API — both records preserved above; if
+  the live leg needs re-proof on the integrated tree, that is new work.
+- Sentry/Seer legs (lane B4b): VERIFIED live per B4b's record. Remaining
+  credential gaps as recorded by lane B4a: still needs `SENTRY_DSN` for
   the harness sandbox project (§2.2); `SENTRY_AUTH_TOKEN` if scripted API
   read-back is to be verified. Seer (§6): still needs Seer enabled + API
   access. Both remain explicit gaps; they do not gate the LangSmith leg.
+- Seer autofix RUN, not the loop (lane B4b): needs a repo integration +
+  code mapping on the sandbox project (HTTP 409 `repos_not_linked`), or an
+  explicit decision to run Seer in summary-only mode.
 - TM-C integration: wiring these sinks behind B3's durable transport + the
   `observability.export_enabled` kill switch (explicitly deferred to merge).
