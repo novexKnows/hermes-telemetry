@@ -26,11 +26,26 @@ envelope VERBATIM — redaction already happened upstream (B1); the exporter
 adds no fields and has no API to add prompt/response/file content.
 
 Dedupe: like B3's ``LocalFileSink``, a duplicate ``event_id`` counts as
-accepted but is not re-transmitted.
+accepted but is not re-transmitted. Server-side, LangSmith keeps exactly ONE
+create per run id — a re-POST of an already-received run create returns
+409 "Run create payload already received" (verified live) — so the
+deterministic per-event run id makes retries idempotent: a 409 is counted as
+accepted-duplicate, never a batch failure.
 
 Credentials (telemetry-contract.md §3.4): read from the environment ONLY, by
 env-var NAME — ``LANGSMITH_API_KEY`` / ``SENTRY_DSN``. No key values ever
 appear in code, docs, logs or test fixtures.
+
+LangSmith tenant scoping (verified live 2026-09-19): a valid ``lsv2_sk_``
+key authenticates (``GET /api/v1/workspaces`` -> 200) but every tenant-scoped
+endpoint (``POST /runs``, ``GET /api/v1/sessions``) returns 403 unless the
+request carries ``X-Tenant-Id: <workspace id>`` — the server cannot resolve
+the workspace from the key alone. The exporter therefore resolves a workspace
+id (constructor arg > ``LANGSMITH_WORKSPACE_ID``/``LANGSMITH_TENANT_ID`` env >
+runtime discovery via ``GET /api/v1/workspaces``) and sends it on every write.
+The workspace id is tenant metadata returned to any authenticated caller, not
+a secret. The official SDK read path supports the same header via its
+``workspace_id`` parameter / ``LANGSMITH_WORKSPACE_ID`` env.
 
 Timeouts are the sink's responsibility (B3 contract); ``timeout`` bounds every
 HTTP call. Export failures never raise out of ``deliver`` — the pinned return
@@ -131,6 +146,17 @@ def _default_post(url: str, body: dict, headers: dict, timeout: float) -> int:
         return int(resp.status)
 
 
+def _default_get(url: str, headers: dict, timeout: float) -> tuple[int, str]:
+    """One blocking HTTP GET. Returns ``(status, body_text)``.
+
+    Raises like ``_default_post`` — callers normalize to the pinned result
+    dict. Used only for tenant discovery; bodies are metadata, never secrets.
+    """
+    req = _urlrequest.Request(url, headers=dict(headers), method="GET")
+    with _urlrequest.urlopen(req, timeout=timeout) as resp:
+        return int(resp.status), resp.read().decode("utf-8", "replace")
+
+
 def _finish_batch(
     exporters_detail: str,
     events: list[dict],
@@ -162,10 +188,19 @@ class LangSmithExporter(Sink):
     ``worktree/branch``) are legal in LangSmith metadata. ``inputs``/``outputs``
     are empty dicts (metadata-only: no prompt, response or file content ever).
 
+    Tenant scoping: the LangSmith API cannot resolve the workspace from the
+    API key alone (writes 403 without it), so a workspace id is resolved
+    once — constructor arg, then ``LANGSMITH_WORKSPACE_ID``/``LANGCHAIN_``
+    ``WORKSPACE_ID``/``LANGSMITH_TENANT_ID``/``LANGCHAIN_TENANT_ID`` env, then
+    runtime discovery via ``GET /api/v1/workspaces`` (first non-deleted
+    workspace visible to the key). The id is tenant metadata, not a secret;
+    failures never name values. With an injected ``post`` transport (unit
+    tests) discovery is disabled unless a ``get`` transport is also injected.
+
     Read-back: ``langsmith_run_id_for_event`` gives the deterministic run id to
-    feed ``langsmith.Client().list_runs(project_name=..., run_ids=[...])`` —
-    the SDK read path used by the integration test and ``docs/telemetry/
-    sandbox-flow.md``.
+    feed ``langsmith.Client(workspace_id=...).list_runs(project_name=...,
+    run_ids=[...])`` — the SDK read path used by the integration test and
+    ``docs/telemetry/sandbox-flow.md``.
     """
 
     DEFAULT_API_URL = "https://api.smith.langchain.com"
@@ -178,9 +213,11 @@ class LangSmithExporter(Sink):
         api_key: str | None = None,
         api_url: str | None = None,
         project: str | None = None,
+        workspace_id: str | None = None,
         timeout: float = 10.0,
         enabled: bool = True,
         post: Callable[[str, dict, dict, float], int] | None = None,
+        get: Callable[[str, dict, float], tuple[int, str]] | None = None,
     ):
         self.api_key = (
             api_key
@@ -200,10 +237,42 @@ class LangSmithExporter(Sink):
             or os.environ.get("LANGCHAIN_PROJECT")
             or self.DEFAULT_PROJECT
         )
+        raw_workspace = (
+            workspace_id
+            or os.environ.get("LANGSMITH_WORKSPACE_ID")
+            or os.environ.get("LANGCHAIN_WORKSPACE_ID")
+            or os.environ.get("LANGSMITH_TENANT_ID")
+            or os.environ.get("LANGCHAIN_TENANT_ID")
+            or ""
+        ).strip()
+        self.workspace_id: str | None = raw_workspace or None
         self.timeout = timeout
         self.enabled = enabled
         self._post = post or _default_post
+        # Discovery transport: available in real mode (no injected post);
+        # an injected post without an injected get means "no network beyond
+        # the POSTs" — unit tests must never make discovery calls.
+        self._get = get if get is not None else (_default_get if post is None else None)
         self._seen: set[str] = set()
+
+    def resolve_workspace_id(self) -> None:
+        """Discover the tenant workspace id (idempotent; sets ``workspace_id``).
+
+        Picks the first non-deleted workspace the key can see (this key family
+        is workspace-scoped; multi-workspace keys should be configured
+        explicitly). Raises on failure — ``deliver`` normalizes to the pinned
+        result dict without naming any value.
+        """
+        if self._get is None:
+            return
+        _status, body = self._get(
+            f"{self.api_url}/api/v1/workspaces", {"x-api-key": self.api_key}, self.timeout
+        )
+        for ws in json.loads(body):
+            if not ws.get("is_deleted"):
+                self.workspace_id = str(ws["id"])
+                return
+        raise ValueError("no active workspace visible to this key")
 
     def make_run(self, event: dict) -> tuple[dict, str | None]:
         """Build the LangSmith run-create payload for one pinned record.
@@ -236,6 +305,19 @@ class LangSmithExporter(Sink):
             return _result(False, 0, "exporter disabled (kill switch)")
         if not self.api_key:
             return _result(False, 0, "no credentials: set LANGSMITH_API_KEY (env, never inline)")
+        if self.workspace_id is None and self._get is not None:
+            try:
+                self.resolve_workspace_id()
+            except Exception as exc:  # noqa: BLE001 — fail closed, names only
+                return _result(
+                    False,
+                    0,
+                    f"langsmith[{self.project}]: tenant resolution failed: {type(exc).__name__}",
+                )
+        headers = {"x-api-key": self.api_key}
+        if self.workspace_id:
+            # Tenant metadata (not a secret) — required or every write 403s.
+            headers["X-Tenant-Id"] = self.workspace_id
         accepted = 0
         dupes = 0
         violations: list[str] = []
@@ -253,10 +335,17 @@ class LangSmithExporter(Sink):
                 accepted += 1
                 continue
             try:
-                self._post(
-                    f"{self.api_url}/runs", payload, {"x-api-key": self.api_key}, self.timeout
-                )
+                self._post(f"{self.api_url}/runs", payload, headers, self.timeout)
             except Exception as exc:  # noqa: BLE001 — normalized to the pinned dict
+                if getattr(exc, "code", None) == 409:
+                    # "Run create payload already received" — the server keeps
+                    # exactly one create per run id, so a retried event (same
+                    # deterministic id) is already durably ingested. Accepted,
+                    # not re-ingested; never a batch failure.
+                    self._seen.add(event_id)
+                    dupes += 1
+                    accepted += 1
+                    continue
                 failures.append(f"{event_id}: {type(exc).__name__}")
                 break
             self._seen.add(event_id)

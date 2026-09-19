@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+import urllib.error
 import uuid
 
 import hermes_telemetry.sinks as sinks
@@ -30,6 +32,10 @@ CREDENTIAL_ENV_VARS = [
     "LANGCHAIN_ENDPOINT",
     "LANGSMITH_PROJECT",
     "LANGCHAIN_PROJECT",
+    "LANGSMITH_WORKSPACE_ID",
+    "LANGCHAIN_WORKSPACE_ID",
+    "LANGSMITH_TENANT_ID",
+    "LANGCHAIN_TENANT_ID",
     "SENTRY_DSN",
 ]
 
@@ -257,6 +263,113 @@ def test_langsmith_env_fallbacks_langchain_names(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# LangSmithExporter — tenant/workspace resolution (X-Tenant-Id)
+# ---------------------------------------------------------------------------
+
+
+class RecordingGet:
+    """Injectable GET transport standing in for tenant discovery."""
+
+    def __init__(self, workspaces: list[dict] | None = None, fail: bool = False):
+        self.calls: list[tuple[str, dict]] = []
+        self.workspaces = (
+            workspaces
+            if workspaces is not None
+            else [
+                {"id": "ws-1", "is_deleted": False},
+                {"id": "ws-2", "is_deleted": True},
+            ]
+        )
+        self.fail = fail
+
+    def __call__(self, url: str, headers: dict, timeout: float) -> tuple[int, str]:
+        self.calls.append((url, headers))
+        if self.fail:
+            raise ConnectionError("injected discovery failure")
+        return 200, json.dumps(self.workspaces)
+
+
+def test_langsmith_tenant_header_from_env(monkeypatch):
+    monkeypatch.setenv("LANGSMITH_WORKSPACE_ID", "ws-env-1")
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    assert exp.workspace_id == "ws-env-1"  # tenant metadata, not a secret
+    result = exp.deliver([make_event(1)])
+    assert result["ok"] is True
+    assert post.calls[0][2]["X-Tenant-Id"] == "ws-env-1"
+
+
+def test_langsmith_tenant_discovery_sets_header_once():
+    get = RecordingGet()
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post, get=get)
+    result = exp.deliver([make_event(1), make_event(2)])
+    assert result["ok"] is True
+    assert exp.workspace_id == "ws-1"  # first non-deleted workspace
+    # Discovery happened once and used the pinned endpoint + key header.
+    assert len(get.calls) == 1
+    url, headers = get.calls[0]
+    assert url == f"{sinks.LangSmithExporter.DEFAULT_API_URL}/api/v1/workspaces"
+    assert headers == {"x-api-key": "test-key"}
+    # Every write carries the discovered tenant id.
+    assert all(h["X-Tenant-Id"] == "ws-1" for _u, _b, h in post.calls)
+
+
+def test_langsmith_tenant_discovery_failure_fails_closed_without_writes():
+    get = RecordingGet(fail=True)
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post, get=get)
+    result = exp.deliver([make_event(1)])
+    assert result["ok"] is False
+    assert "tenant resolution failed" in result["detail"]
+    assert post.calls == []  # fail closed: without tenant scoping writes 403
+    assert "test-key" not in result["detail"]  # names only, never values
+
+
+def test_langsmith_injected_post_without_get_skips_discovery():
+    """Backward compat: custom write transport + no get -> no discovery call."""
+    post = RecordingPost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=post)
+    assert exp._get is None
+    result = exp.deliver([make_event(1)])
+    assert result["ok"] is True
+    assert "X-Tenant-Id" not in post.calls[0][2]
+
+
+class DuplicateCreatePost(RecordingPost):
+    """Transport mimicking LangSmith's one-create-per-run-id rule (409 on re-POST)."""
+
+    def __call__(self, url: str, body: dict, headers: dict, timeout: float) -> int:
+        event_key = body.get("extra", {}).get("metadata", {}).get("event_id")
+        if event_key in self.calls_seen:
+            raise urllib.error.HTTPError(
+                url=url, code=409, msg="Run create payload already received", hdrs=None, fp=None
+            )
+        self.calls_seen.add(event_key)
+        return super().__call__(url, body, headers, timeout)
+
+    def __init__(self, fail_on: set[str] | None = None):
+        super().__init__(fail_on)
+        self.calls_seen: set[str] = set()
+
+
+def test_langsmith_server_duplicate_create_counts_accepted():
+    """409 on re-POST (retry across exporter instances) is accepted-duplicate."""
+    first = DuplicateCreatePost()
+    exp = sinks.LangSmithExporter(api_key="test-key", post=first)
+    result = exp.deliver([make_event(1)])
+    assert result["ok"] is True
+
+    retry = DuplicateCreatePost()  # fresh exporter, server already has the run
+    retry.calls_seen.add("ev-0001")
+    exp2 = sinks.LangSmithExporter(api_key="test-key", post=retry)
+    result2 = exp2.deliver([make_event(1)])
+    assert result2["ok"] is True
+    assert result2["accepted"] == 1
+    assert "deduped 1" in result2["detail"]
+
+
+# ---------------------------------------------------------------------------
 # SentryExporter — unit (mock transport, no network)
 # ---------------------------------------------------------------------------
 
@@ -356,13 +469,34 @@ def _has_ambient_langsmith_creds(ambient: dict) -> bool:
     return bool(ambient.get("LANGSMITH_API_KEY") or ambient.get("LANGCHAIN_API_KEY"))
 
 
+def _readback_with_retry(client, project: str, run_ids: list[str], timeout_s: float = 60.0) -> list:
+    """Poll the SDK read path until every run id is visible (ingestion lag).
+
+    LangSmith indexes runs asynchronously: a run-create returns 202 long
+    before ``list_runs`` can see it (observed lag: a few seconds). Bounded
+    retry — if the deadline passes with runs missing, the (partial) result is
+    returned and the caller's assertions fail on the REAL state, never a
+    fabricated success.
+    """
+    deadline = time.monotonic() + timeout_s
+    back: list = []
+    while True:
+        back = list(client.list_runs(project_name=project, run_ids=run_ids))
+        if len(back) == len(run_ids) or time.monotonic() >= deadline:
+            return back
+        time.sleep(3.0)
+
+
 def test_integration_langsmith_sandbox_end_to_end(credential_env_snapshot_and_clear, monkeypatch):
     """Real metadata-only sandbox flow: deliver -> SDK read-back proves arrival.
 
-    Requires LANGSMITH_API_KEY in the ambient env (sandbox project
-    sovav-hermes-sandbox, or LANGSMITH_PROJECT override). Uses the official
-    ``langsmith`` SDK READ path only; the write path is the exporter itself.
-    Skips (not fails) without credentials — the no-fabrication gate.
+    Requires LANGSMITH_API_KEY in the ambient env (loaded directly or by the
+    conftest runtime-credential loader from the approved key file; sandbox
+    project sovav-hermes-sandbox, or LANGSMITH_PROJECT override). Tenant
+    scoping: the write path discovers the workspace id automatically; the SDK
+    read path gets the same id via ``Client(workspace_id=...)``. Uses the
+    official ``langsmith`` SDK READ path only; the write path is the exporter
+    itself. Skips (not fails) without credentials — the no-fabrication gate.
     """
     langsmith = pytest.importorskip("langsmith")
     ambient = credential_env_snapshot_and_clear
@@ -384,8 +518,8 @@ def test_integration_langsmith_sandbox_end_to_end(credential_env_snapshot_and_cl
     assert result["ok"] is True, result["detail"]
     assert result["accepted"] == 3
 
-    client = langsmith.Client()  # reads LANGSMITH_API_KEY from env itself
-    back = list(client.list_runs(project_name=project, run_ids=run_ids))
+    client = langsmith.Client(workspace_id=exp.workspace_id)  # key comes from env itself
+    back = _readback_with_retry(client, project, run_ids)
     assert len(back) == 3
     got_event_ids = {r.extra.get("metadata", {}).get("event_id") for r in back}
     assert got_event_ids == {"ev-0901", "ev-0902", "ev-0903"}
@@ -414,11 +548,9 @@ def test_integration_langsmith_readback_is_metadata_only(
     result = exp.deliver([event])
     assert result["ok"] is True
 
-    client = langsmith.Client()
-    back = list(
-        client.list_runs(
-            project_name=project, run_ids=[sinks.langsmith_run_id_for_event(event["event_id"])]
-        )
+    client = langsmith.Client(workspace_id=exp.workspace_id)
+    back = _readback_with_retry(
+        client, project, [sinks.langsmith_run_id_for_event(event["event_id"])]
     )
     assert len(back) == 1
     run = back[0]
