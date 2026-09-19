@@ -3,3 +3,12 @@
 # the drift test (tests/test_envelope_schema_drift.py) goes red.
 schemas/correlation-envelope.schema.json eol=lf
 docs/telemetry/telemetry-contract.md eol=lf
+
+# Byte-stable pinned artifact (HTB-B3): never apply end-of-line conversion to
+# the pinned R-OBS-00 correlation-envelope schema copy. Its bytes are
+# hash-pinned (transport.PINNED_SCHEMA_SHA256, drift-guarded by
+# tests/test_transport.py::test_pinned_schema_hash_matches); with
+# core.autocrlf=true on Windows, a plain `git archive`/checkout would emit
+# CRLF and break the pinned digest. `-text` = the blob is stored and checked
+# out verbatim, on every platform and in every export.
+docs/telemetry/correlation-envelope.schema.json -text

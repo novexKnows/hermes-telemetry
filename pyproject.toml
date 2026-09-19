@@ -28,6 +28,7 @@ classifiers = [
 ]
 dependencies = [
     "watchdog>=3.0",  # budget.yaml file watcher for hot-reload
+    "jsonschema>=4.18",  # Draft-2020-12 validation of the transport envelope boundary (fail-closed)
 ]
 
 [project.urls]

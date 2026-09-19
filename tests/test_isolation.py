@@ -18,10 +18,13 @@ import hermes_telemetry.db as db
 
 
 def test_path_helpers_resolve_under_hermes_home(tmp_path, monkeypatch):
-    """The path helpers must derive from HERMES_HOME, not Path.home()."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    assert budget._budget_path() == tmp_path / "telemetry" / "budget.yaml"
-    assert budget._pricing_path() == tmp_path / "telemetry" / "pricing.yaml"
+    """The path helpers must derive from HERMES_HOME (or the pinned
+    HERMES_TELEMETRY_HOME), never Path.home()."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("HERMES_TELEMETRY_HOME", str(tmp_path / "telemetry-home"))
+    tele = tmp_path / "telemetry-home" / "telemetry"
+    assert budget._budget_path() == tele / "budget.yaml"
+    assert budget._pricing_path() == tele / "pricing.yaml"
 
 
 def test_budget_status_ignores_real_home_pricing(tmp_path, monkeypatch):
@@ -66,23 +69,34 @@ def test_budget_status_ignores_real_home_pricing(tmp_path, monkeypatch):
     )
 
 
-def test_conftest_neutralizes_ambient_telemetry_home():
-    """The autouse isolation fixture must clear HERMES_TELEMETRY_HOME so a
-    developer's ambient value cannot override the tmp HERMES_HOME and leak the
-    suite into the real telemetry dir."""
+def test_conftest_pins_ambient_telemetry_home(tmp_path):
+    """The autouse isolation fixture must PIN HERMES_TELEMETRY_HOME to a
+    disposable root (not merely delete it): paths.py gives HERMES_TELEMETRY_HOME
+    priority over HERMES_HOME, so deletion alone would let an ambient value
+    re-set later (or a missed fixture layer) leak the suite into the real
+    telemetry dir. The pinned value must live inside the per-test tmp dir and
+    must never be the developer's real telemetry home."""
     import os
 
-    assert "HERMES_TELEMETRY_HOME" not in os.environ
+    val = os.environ.get("HERMES_TELEMETRY_HOME")
+    assert val is not None, "HERMES_TELEMETRY_HOME must be pinned, not left ambient"
+    assert val.startswith(str(tmp_path)), (
+        f"HERMES_TELEMETRY_HOME must resolve inside the disposable tmp root, got {val}"
+    )
 
 
-def test_telemetry_home_precedence_stays_in_tmp():
-    """With the fixture active and no ambient var, telemetry resolves under the
-    tmp HERMES_HOME — never the developer's real ~/.hermes."""
+def test_telemetry_home_precedence_stays_in_tmp(tmp_path):
+    """With the fixture active, telemetry resolves under the pinned disposable
+    HERMES_TELEMETRY_HOME — never the developer's real ~/.hermes/telemetry."""
     import os
 
     import hermes_telemetry.paths as paths
 
-    assert paths.get_telemetry_home() == Path(os.environ["HERMES_HOME"]) / "telemetry"
+    expected = Path(os.environ["HERMES_TELEMETRY_HOME"]) / "telemetry"
+    assert paths.get_telemetry_home() == expected
+    assert expected.is_relative_to(tmp_path), (
+        f"telemetry home must resolve inside the disposable tmp root, got {expected}"
+    )
 
 
 def test_budget_paths_honor_telemetry_home(tmp_path, monkeypatch):

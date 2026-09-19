@@ -29,6 +29,12 @@ def reset_pricing(tmp_path_factory, monkeypatch):
     tele.mkdir()
     shutil.copy(FIXTURES / "pricing.yaml", tele / "pricing.yaml")
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Layered isolation: HERMES_TELEMETRY_HOME outranks HERMES_HOME (paths.py),
+    # and the conftest autouse fixture pins it to the per-test tmp_path — which
+    # would silently override this seeded home. Remove it HERE so this fixture's
+    # seeded home (and any per-test HERMES_HOME override) stays authoritative —
+    # the conftest-level pin still guards every other test against ambient leaks.
+    monkeypatch.delenv("HERMES_TELEMETRY_HOME", raising=False)
 
     pricing._custom_pricing = None
     pricing._warned_unknown.clear()

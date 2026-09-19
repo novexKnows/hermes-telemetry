@@ -118,7 +118,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install pytest pyyaml
+        run: pip install pytest pyyaml jsonschema
 
       - name: Run tests
         run: pytest tests/ -v --tb=short

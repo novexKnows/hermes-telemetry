@@ -1004,6 +1004,22 @@ def register(ctx) -> None:  # noqa: ANN001
     )
 
     # ------------------------------------------------------------------
+    # /telemetry-status slash command (fail-closed transport surface)
+    # ------------------------------------------------------------------
+    try:
+        from . import transport as _transport
+
+        ctx.register_command(
+            "telemetry-status",
+            _transport.handle_status,
+            description="Show durable event transport status: journaled/delivered/pending, "
+            "staleness, outage ledger state",
+            args_hint="[json]",
+        )
+    except Exception as exc:
+        tele_log.error("telemetry-status command registration failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # hermes telemetry CLI command (out-of-session stats/budget access)
     # ------------------------------------------------------------------
     try:

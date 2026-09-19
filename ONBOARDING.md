@@ -81,6 +81,11 @@ hermes-telemetry/
 │                          runs/tool_calls that flag session anti-patterns
 │                          (context rotation, loop traps, tool thrashing, high
 │                          error rate, massive sessions). See `§ Agent Intelligence`.
+├── transport.py         ← Durable event transport (HTB-B3): append-only JSONL
+│                          journal + fsync, cursor state, bounded retry/backoff
+│                          delivery, outage ledger, /telemetry-status. See
+│                          `§ Durable Event Transport` and
+│                          docs/telemetry/transport-failclosed.md.
 ├── moa.py               ← Mixture-of-Agents awareness. Resolves the `provider=
 │                          "moa"` virtual-provider preset to its aggregator's
 │                          real provider/model so the call is priced/attributed
@@ -1374,6 +1379,86 @@ intentional canary.
 
 ---
 
+## Durable Event Transport (transport.py)
+
+`transport.py` is a durable, fail-closed local queue for R-OBS-00 correlation
+envelopes (HTB-B3). Full outage/staleness matrix with per-row test names:
+`docs/telemetry/transport-failclosed.md`.
+
+### Non-obvious design decisions
+
+1. **Journal before sink, fsync before return.** `enqueue(envelope)` appends
+   one JSONL line to `<telemetry home>/transport/events.jsonl` (via
+   `paths.get_transport_dir()`) and fsyncs BEFORE any sink attempt. The
+   receipt `{event_id, journal_offset}` is durable on return. The transport
+   receives ALREADY-REDACTED envelopes (B1 owns redaction); `enqueue` ENFORCES
+   that precondition before journal append: an envelope that is missing a
+   required base field, carries an unknown field, violates an enum (`call_class`,
+   `repo`) or any other pinned-schema constraint, or carries secret-shaped
+   / content-sentinel strings in any field (matched after the same Unicode
+   default-ignorable stripping B1 applies) raises `ValueError` and is NEVER
+   journaled — fail-closed means conforming envelopes are durable before any
+   sink attempt and non-conforming ones are rejected outright. The full
+   jsonschema Draft-2020-12 validation against the byte-identical schema copy
+   shipped at `docs/telemetry/correlation-envelope.schema.json` is MANDATORY,
+   not best-effort: a missing/unreadable pinned copy or an unusable
+   `jsonschema` package REJECTS the event (returns fail-closed violations) —
+   it never silently degrades to the structural checks alone
+   (`test_enqueue_fails_closed_when_pinned_schema_missing_or_unreadable`,
+   `test_enqueue_fails_closed_when_jsonschema_unusable`). `jsonschema` is a
+   declared runtime dependency (pyproject.toml) and installed by CI.
+2. **Cursor, not per-event flags.** `state.json` holds `cursor_offset` (byte
+   offset through which every record is accepted at the sink),
+   `delivered_count`, `last_success_at`, `journal_size` (used by the torn-line
+   repair to validate only the untrusted tail), and the open outage episode.
+   Crash resume = seek to cursor. Delivered events are counted, never listed.
+3. **At-least-once + sink-side dedupe.** A crash between sink-accept and
+   cursor-persist redelivers the batch. Records carry a stable `event_id`;
+   sinks MUST dedupe on it (`LocalFileSink` is the conformance reference).
+   The transport never assumes exactly-once by itself.
+4. **Partial accept stops the flush.** `sink.deliver()` returns
+   `{ok, accepted, detail}`; `accepted` counts events durable IN ORDER. A
+   partial accept advances the cursor over the accepted prefix only, then ends
+   the flush with the remainder pending — the next flush redelivers exactly
+   the unaccepted tail (never the accepted prefix).
+5. **The sink owns its timeout.** The transport treats any exception or
+   non-conforming result as a failed attempt and retries with exponential
+   backoff (base·2ⁿ, capped, retry budget reset on success). It does NOT wrap
+   `deliver()` in a thread timeout — B4 exporters own their HTTP timeouts.
+6. **Torn final line, never silent.** On init the journal tail beyond
+   `journal_size` is validated; a torn partial line is truncated at the last
+   complete record with a logged warning and a persisted `torn_truncations`
+   counter. Earlier complete records are never touched (append-only writes
+   mean only the LAST line can be torn).
+7. **No-sink default is fail-closed.** With no sink configured, events
+   accumulate as pending (visible staleness) — never dropped, never fatal.
+8. **Ledger refresh, not just open.** Every flush that ends with pending
+   records durably opens OR updates the outage ledger. When an episode is
+   already open from an earlier flush, an `update` entry (same `episode_id`)
+   records the CURRENT pending ids/count/staleness, so work queued during an
+   outage is never absent from the durable record
+   (`test_second_failed_flush_updates_open_episode`).
+9. **The pinned schema copy is byte-stable and its validator is mandatory.**
+   The shipped schema copy is hash-pinned (`PINNED_SCHEMA_SHA256`); its bytes
+   must survive `git archive`/checkout on every platform, so `.gitattributes`
+   marks it `-text` (with `core.autocrlf=true` on Windows a plain archive
+   would emit CRLF and break the pinned digest — the R3C round-3 finding).
+   Because full Draft-2020-12 validation is fail-closed (see decision 1),
+   the `jsonschema` runtime dependency is declared and CI-installed: an
+   enqueue must never silently run without it.
+
+### /telemetry-status
+
+Registered in `register()` via `ctx.register_command` (verified signature in
+the live source: `register_command(name, handler(raw_args: str) -> str,
+description=..., args_hint=...)` — same pattern as /stats). Human output by
+default; `/telemetry-status json` returns the machine-readable record with the
+pinned keys `journaled`, `delivered`, `pending`, `oldest_pending_age_seconds`,
+`last_success_at` (+ `cursor_offset`, `torn_truncations`, `outage_open`,
+`sink_configured`, `transport_dir`).
+
+---
+
 ## Test Isolation Contract
 
 **Tests never read or write the real `~/.hermes`.** This is enforced, not just convention.
@@ -1409,13 +1494,22 @@ seed it in the per-test temp dir, not rely on real files.
 pytest's built-in `tmp_path` fixture mints this per test. Override the base dir
 with `pytest --basetemp=DIR`.
 
-### `HERMES_TELEMETRY_HOME` neutralization
+### `HERMES_TELEMETRY_HOME` pinning
 
 `HERMES_TELEMETRY_HOME` outranks `HERMES_HOME` when resolving telemetry paths. The autouse
-`isolate_hermes_home` fixture (`conftest.py`) therefore DELETES `HERMES_TELEMETRY_HOME` per
-test, so a developer's ambient value cannot override the tmp redirect and leak the suite into
-the real `~/.hermes/telemetry`. Enforced by
-`tests/test_isolation.py::test_conftest_neutralizes_ambient_telemetry_home`.
+`isolate_hermes_home` fixture (`conftest.py`) therefore PINS `HERMES_TELEMETRY_HOME` to the
+same per-test temp directory (it never merely deletes the ambient value): an ambient
+developer value cannot override the tmp redirect, and the resolution target is always a
+disposable root. The transport tests add a second pin layer
+(`tests/test_transport.py::double_isolation`), and the transport journal regression is a
+deterministic interception proof
+(`test_transport_journal_isolated_from_real_home`): every open primitive the transport can
+reach (builtins.open, io.open, os.open, pathlib.Path.open/read_text/read_bytes) is
+intercepted during enqueue+flush and every captured path must stay inside the disposable
+root — the real-home check is lexical only and the test never reads live real-home state,
+so concurrent Hermes telemetry writes cannot race it. Enforced by
+`tests/test_isolation.py::test_conftest_pins_ambient_telemetry_home` and
+`test_telemetry_home_precedence_stays_in_tmp`.
 
 ---
 

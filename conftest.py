@@ -43,14 +43,17 @@ def isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))  # Windows equivalent of HOME
     # HERMES_TELEMETRY_HOME outranks HERMES_HOME (paths.get_telemetry_home);
-    # a developer's ambient value must never override the tmp redirect and leak
-    # the suite into the real ~/.hermes/telemetry. Neutralize (unset) it per
-    # test so telemetry resolves under the tmp HERMES_HOME — the repo-wide
-    # contract asserted by tests/test_isolation.py::test_conftest_neutralizes_ambient_telemetry_home.
+    # a developer's ambient value would otherwise override the tmp redirect and
+    # leak the suite into the real ~/.hermes/telemetry. PIN it (don't just
+    # delete it): pinning means an ambient value can never leak through and the
+    # resolution target is always a disposable root — the repo-wide contract
+    # asserted by tests/test_isolation.py::test_conftest_pins_ambient_telemetry_home.
     # (Isolation incident 2026-09-19: an inherited value routed synthetic rows
     # into the real telemetry DB. B1 emission tests additionally pin BOTH vars
-    # explicitly — see tests/test_envelope_emission.py::clean_envelope_state.)
-    monkeypatch.delenv("HERMES_TELEMETRY_HOME", raising=False)
+    # explicitly — see tests/test_envelope_emission.py::clean_envelope_state.
+    # test_transport.py's double_isolation fixture re-pins it per-test as a
+    # second layer.)
+    monkeypatch.setenv("HERMES_TELEMETRY_HOME", str(tmp_path))
 
 
 @pytest.fixture(autouse=True)
