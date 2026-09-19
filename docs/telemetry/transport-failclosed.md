@@ -27,7 +27,10 @@ transport never redacts and never silently drops.
 4. **Outage ledger.** Every delivery episode that ends with pending events
    opens a ledger entry (`outage_ledger.jsonl`) recording the undelivered
    event ids and the staleness (age of the oldest pending event); a later
-   successful flush closes the episode. No outage is ever silent.
+   successful flush closes the episode. Every flush that still ends with
+   pending records while an episode is ALREADY open durably refreshes it with
+   an `update` entry (same `episode_id`, current pending set) — the ledger is
+   never left stale by newly queued work. No outage is ever silent.
 5. **No drop paths.** There is no code path that removes an event from the
    journal or leaves the pending count unaccounted. A torn final journal line
    (partial write) is truncated with a logged warning and a persisted
@@ -94,8 +97,13 @@ Supplementary non-matrix tests:
 | Partial-accept terminal path opens the outage ledger for the remainder | `test_partial_accept_terminal_opens_outage_for_remainder` |
 | Envelope precondition enforced: unknown fields / missing base fields / Turnstone-vs-harness shape violations rejected before journal append | `test_enqueue_rejects_unknown_fields`, `test_enqueue_rejects_envelope_missing_base_fields`, `test_turnstone_originated_envelope_requires_extensions` |
 | Sentinel-leak rejection: secret-shaped strings and PROMPT_TEXT/RESPONSE_TEXT/FILE_CONTENT sentinels in any field rejected before journal append | `test_enqueue_rejects_secret_shaped_and_content_sentinels` |
-| Pinned schema drift guard: embedded shape pinned to the ratified R-OBS-00 v1.0.0 schema copy (sha256) | `test_pinned_schema_hash_matches` |
-| Double-env isolation: journal lands in the disposable pinned roots; real-home files untouched | `test_transport_journal_isolated_from_real_home` + `test_conftest_pins_ambient_telemetry_home` (tests/test_isolation.py) |
+| Unicode default-ignorable obfuscation (e.g. `PROM<U+200B>PT_TEXT`) cannot defeat the sentinel/secret scan — stripped before matching | `test_enqueue_rejects_unicode_obfuscated_sentinel` |
+| `repo` enum (only "turnstone" or null) enforced before journal append | `test_enqueue_rejects_invalid_repo_enum` |
+| Complete pinned v1.0.0 schema semantics: enqueue agrees with independent jsonschema Draft-2020-12 validation on a valid/invalid corpus | `test_enqueue_full_jsonschema_enforcement` |
+| Full validation is MANDATORY and fail-closed: a missing/unreadable pinned schema copy or an unusable `jsonschema` package REJECTS the event (never silently accepts) | `test_enqueue_fails_closed_when_pinned_schema_missing_or_unreadable`, `test_enqueue_fails_closed_when_jsonschema_unusable` |
+| Second failed flush after newly queued work durably UPDATES the open outage episode (same episode_id, current pending set) | `test_second_failed_flush_updates_open_episode` |
+| Pinned schema drift guard: embedded shape pinned to the ratified R-OBS-00 v1.0.0 schema copy (sha256); shipped runtime copy byte-identical — and byte-stable through `git archive`/checkout via `.gitattributes` (`-text`) | `test_pinned_schema_hash_matches` |
+| Double-env isolation: journal lands in the disposable pinned roots; deterministic interception proof across all open primitives (builtins/io/os.open + pathlib seams), no live real-home state read | `test_transport_journal_isolated_from_real_home` + `test_conftest_pins_ambient_telemetry_home` (tests/test_isolation.py) |
 | `/telemetry-status` human + machine-readable (`json` arg) output with the pinned count keys | `test_handle_status_human_and_json` |
 | Store lives under disposable HERMES_TELEMETRY_HOME/HERMES_HOME (never real `~/.hermes`) | `test_transport_store_lives_under_hermes_home` + conftest autouse fixture |
 | Concurrent enqueue: unique event_ids and journal offsets, complete drain | `test_concurrent_enqueue_offsets_unique_and_complete` |

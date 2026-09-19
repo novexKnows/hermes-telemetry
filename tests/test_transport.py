@@ -14,8 +14,12 @@ instances share a store.
 
 from __future__ import annotations
 
+import builtins
+import io
 import json
 import os
+import pathlib
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -29,10 +33,10 @@ from hermes_telemetry.transport import LocalFileSink, MockSink, Transport
 # ---------------------------------------------------------------------------
 # Isolation (A2 incident regression guard)
 #
-# The two module-level captures below run at IMPORT time, i.e. BEFORE the
-# autouse fixtures pin HOME/USERPROFILE/HERMES_* to tmp dirs — so they capture
-# what the developer's REAL telemetry home is on this machine. The isolation
-# regression test snapshots it and proves the transport never writes there.
+# The module-level capture below runs at IMPORT time, i.e. BEFORE the autouse
+# fixtures pin HOME/USERPROFILE/HERMES_* to tmp dirs — so it captures what the
+# developer's REAL telemetry home is on this machine (a path string only; the
+# isolation regression test never reads or writes inside it).
 # ---------------------------------------------------------------------------
 
 _REAL_TELEMETRY_HOME_NO_ENV = (
@@ -43,17 +47,6 @@ _REAL_TELEMETRY_HOME_NO_ENV = (
     )
     / "telemetry"
 )
-_REAL_HOME_PROBE_SNAPSHOT: dict[Path, tuple[bool, int | None, int | None]] = {
-    p: (
-        p.exists(),
-        p.stat().st_mtime_ns if p.exists() else 0,
-        p.stat().st_size if p.exists() else 0,
-    )
-    for p in (
-        _REAL_TELEMETRY_HOME_NO_ENV / "telemetry.db",
-        _REAL_TELEMETRY_HOME_NO_ENV / "telemetry.log",
-    )
-}
 
 # ---------------------------------------------------------------------------
 # Isolation (A2 incident regression guard)
@@ -507,6 +500,53 @@ def test_partial_accept_terminal_opens_outage_for_remainder(tmp_path):
     assert entry["event"] == "open" and entry["pending_count"] == 2
 
 
+def test_second_failed_flush_updates_open_episode(tmp_path):
+    """Blocking regression (R3B round-2 #1): an ALREADY-OPEN outage episode
+    must be durably UPDATED — not left stale — when a later flush ends with
+    more pending records. Probe from the round-2 review: first failed flush
+    opens the ledger with pending_count=1; enqueue a second event and fail
+    another flush → status.pending=2 AND the ledger record now carries the
+    current pending set under the SAME episode id."""
+    t = make_transport(failing_sink(), tmp_path, max_retries=1)
+    r1 = t.enqueue(make_envelope(trace="trc_first"))
+    t.flush()
+    ledger_path = tmp_path / "transport" / "outage_ledger.jsonl"
+    first = json.loads(ledger_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert first["event"] == "open" and first["pending_count"] == 1
+    assert first["pending_event_ids"] == [r1["event_id"]]
+    episode_id = first["episode_id"]
+
+    # Second event queued + second failed flush: the SAME open episode must be
+    # refreshed with the current pending ids/count/staleness.
+    r2 = t.enqueue(make_envelope(trace="trc_second"))
+    summary = t.flush()
+    assert summary["ok"] is False and summary["pending"] == 2
+    status = t.status()
+    assert status["outage_open"] is True and status["pending"] == 2
+    lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    update = json.loads(lines[-1])
+    assert update["event"] == "update"
+    assert update["episode_id"] == episode_id  # refreshed, not re-opened
+    assert update["pending_count"] == 2
+    assert update["pending_event_ids"] == [r1["event_id"], r2["event_id"]]
+    assert update["oldest_pending_age_seconds"] >= first["oldest_pending_age_seconds"]
+    assert update["kind"] == "sink_unavailable"
+    # No second episode was ever opened; every ledger line is the one episode.
+    assert {json.loads(line)["episode_id"] for line in lines} == {episode_id}
+
+    # Draining closes the episode; a later failing flush opens a NEW one.
+    t.sink = MockSink()
+    drained = t.flush()
+    assert drained["ok"] is True and drained["pending"] == 0
+    assert t.status()["outage_open"] is False
+    t.sink = failing_sink()
+    t.enqueue(make_envelope(trace="trc_after"))
+    t.flush()
+    reopened = json.loads(ledger_path.read_text(encoding="utf-8").splitlines()[-1])
+    assert reopened["event"] == "open" and reopened["episode_id"] != episode_id
+    assert reopened["pending_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Envelope metadata-only boundary (redaction precondition, ENFORCED)
 # ---------------------------------------------------------------------------
@@ -560,6 +600,183 @@ def test_enqueue_rejects_secret_shaped_and_content_sentinels(tmp_path):
     assert not journal.exists() or journal.read_text(encoding="utf-8") == ""
 
 
+def test_enqueue_rejects_unicode_obfuscated_sentinel(tmp_path):
+    """Blocking regression (R3B round-2 #2): default-ignorable Unicode inside a
+    banned sentinel or secret must not defeat the banned-content scan. The
+    exact round-2 probe: ``PROM<U+200B>PT_TEXT`` in ``model`` was accepted and
+    journaled. Now default-ignorables (Cf/Zl/Zp + outliers, mirroring B1
+    redaction.py `_strip_default_ignorables`) are stripped BEFORE every
+    sentinel and secret-pattern check."""
+    t = make_transport(failing_sink(), tmp_path)
+    obfuscated = {
+        "zero-width space in model": ("model", "PROM\u200bPT_TEXT: adversarial prompt payload"),
+        "zero-width joiner in key_id": ("key_id", "sk-\u200ba1b2c3d4e5f6g7h8i9j0"),
+        "invisible separator in trace": ("trace_id", "RESP\u2063ONSE_TEXT: leaked answer"),
+        "variation selector in board": ("board", "FILE\ufe00_CONTENT: secret bytes"),
+        "hangul filler in profile": ("profile/role", "FILE\u3164_CONTENT: secret bytes"),
+    }
+    for name, (field, value) in obfuscated.items():
+        envelope = make_envelope()
+        envelope[field] = value
+        with pytest.raises(ValueError) as exc_info:
+            t.enqueue(envelope)
+        assert "before journal append" in str(exc_info.value), name
+    assert t.status()["journaled"] == 0
+    assert not (t.dir / "events.jsonl").exists()
+    # The literal (unobfuscated) forms are still rejected as before...
+    plain = make_envelope()
+    plain["model"] = "PROMPT_TEXT: adversarial prompt payload"
+    with pytest.raises(ValueError):
+        t.enqueue(plain)
+    # ...and a legitimate model id still passes — stripping must not
+    # false-positive on ordinary metadata values.
+    receipt = t.enqueue(make_envelope())
+    assert receipt["event_id"].startswith("evt_")
+
+
+def test_enqueue_rejects_invalid_repo_enum(tmp_path):
+    """Blocking regression (R3B round-2 #3): the pinned schema's ``repo`` enum
+    allows only \"turnstone\" or null — any other value (e.g. the round-2 probe
+    ``repo: \"not-turnstone\"``) is rejected before journal append, never
+    journaled or delivered."""
+    t = make_transport(failing_sink(), tmp_path)
+    for bad_repo in ("not-turnstone", "hermes", ""):
+        envelope = make_envelope()
+        envelope["repo"] = bad_repo
+        with pytest.raises(ValueError) as exc_info:
+            t.enqueue(envelope)
+        assert "before journal append" in str(exc_info.value), f"repo={bad_repo!r}"
+    # Null and absent remain valid; repo=turnstone with full extensions too.
+    none_repo = make_envelope()
+    none_repo["repo"] = None
+    assert t.enqueue(none_repo)["event_id"].startswith("evt_")
+    turnstone = make_envelope()
+    turnstone["repo"] = "turnstone"
+    for req in tmod._TURNSTONE_REQUIRED:
+        turnstone[req] = "dev" if req == "runtime_environment" else f"val_{req}"
+    assert t.enqueue(turnstone)["event_id"].startswith("evt_")
+    # The rejected probes never reached the journal.
+    journal_lines = (t.dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(journal_lines) == 2  # only the two valid envelopes
+
+
+def test_enqueue_full_jsonschema_enforcement(tmp_path):
+    """Blocking regression (R3B round-2 #3, complete semantics): enqueue enforces
+    the COMPLETE pinned v1.0.0 schema — full jsonschema Draft-2020-12 validation
+    against the shipped byte-identical copy — not just property/required-set
+    parity. For every envelope below, the transport's enqueue decision must
+    agree with the independent Draft-2020-12 verdict.
+
+    R3C round-3 #2: jsonschema is a DECLARED runtime dependency (pyproject.toml,
+    installed by CI) and full validation is MANDATORY — this test is required,
+    never skipped: no importorskip. If jsonschema were missing here the test
+    would error, which is exactly the fail-closed contract."""
+    import jsonschema
+
+    schema = tmod._pinned_schema()
+    assert schema is not None
+    validator_cls = jsonschema.validators.validator_for(schema)
+    validator_cls.check_schema(schema)
+    independent = validator_cls(schema)
+
+    turnstone_ok = make_envelope()
+    turnstone_ok["repo"] = "turnstone"
+    for req in tmod._TURNSTONE_REQUIRED:
+        turnstone_ok[req] = "dev" if req == "runtime_environment" else f"val_{req}"
+
+    def with_field(field, value):
+        env = make_envelope()
+        env[field] = value
+        return env
+
+    valid = [
+        make_envelope(),  # base fields only (extensions absent)
+        with_field("repo", None),  # extensions present-but-null
+        turnstone_ok,
+    ]
+    invalid = [
+        with_field("repo", "not-turnstone"),  # enum violation (round-2 probe)
+        with_field("prompt", "leaked content"),  # unknown field
+        {"task_id": "t_x"},  # missing required base fields
+        with_field("call_class", "weird"),  # call_class enum
+        with_field("handoff_id", 5),  # handoff_id must be str|null
+        with_field("run_id", True),  # run_id must be int|str (bool is not int)
+        with_field("parent_task_ids", ["a", "a"]),  # uniqueItems
+        with_field("parent_task_ids", [1]),  # items: string
+        with_field("key_id", ""),  # minLength 1
+        dict(turnstone_ok, runtime_environment="local"),  # Turnstone env enum
+        dict(turnstone_ok, harness_task_id="t_1", harness_run_id=None),  # pair rule
+        dict(turnstone_ok, worker_id=None),  # Turnstone extension narrowed to str
+    ]
+
+    for i, envelope in enumerate(valid):
+        errors = list(independent.iter_errors(envelope))
+        assert not errors, f"valid case {i} must satisfy the pinned schema: {errors}"
+        t = make_transport(failing_sink(), tmp_path / f"valid{i}")  # isolated store
+        receipt = t.enqueue(envelope)  # must NOT raise
+        assert receipt["event_id"].startswith("evt_")
+    for i, envelope in enumerate(invalid):
+        errors = list(independent.iter_errors(envelope))
+        assert errors, f"invalid case {i} must violate the pinned schema"
+        t = make_transport(failing_sink(), tmp_path / f"invalid{i}")  # isolated store
+        with pytest.raises(ValueError) as exc_info:
+            t.enqueue(envelope)
+        assert "before journal append" in str(exc_info.value), (
+            f"invalid case {i} rejected with: {exc_info.value}"
+        )
+        assert t.status()["journaled"] == 0
+
+
+def test_enqueue_fails_closed_when_pinned_schema_missing_or_unreadable(tmp_path, monkeypatch):
+    """Blocking regression (R3C round-3 #2): the reviewer's probe redirected
+    _EMBEDDED_SCHEMA_PATH to a missing file and enqueue still accepted and
+    journaled the envelope (fail-open). Full validation is now MANDATORY: a
+    missing OR unreadable pinned schema copy must REJECT the event — never
+    silently accept it."""
+    t = make_transport(failing_sink(), tmp_path)
+    real_schema_path = tmod._EMBEDDED_SCHEMA_PATH
+    # (a) missing file
+    monkeypatch.setattr(
+        tmod, "_EMBEDDED_SCHEMA_PATH", tmp_path / "absent" / "correlation-envelope.schema.json"
+    )
+    with pytest.raises(ValueError) as exc_info:
+        t.enqueue(make_envelope())
+    assert "fail-closed" in str(exc_info.value)
+    assert t.status()["journaled"] == 0
+    assert not (t.dir / "events.jsonl").exists()
+    # (b) unreadable/corrupt file (not valid JSON)
+    corrupt = tmp_path / "corrupt.schema.json"
+    corrupt.write_text("{not json at all", encoding="utf-8")
+    monkeypatch.setattr(tmod, "_EMBEDDED_SCHEMA_PATH", corrupt)
+    with pytest.raises(ValueError) as exc_info:
+        t.enqueue(make_envelope())
+    assert "fail-closed" in str(exc_info.value)
+    assert t.status()["journaled"] == 0
+    assert not (t.dir / "events.jsonl").exists()
+    # A valid envelope is accepted again once the pinned copy is reachable —
+    # the gate rejects the missing dependency, not the envelope itself.
+    monkeypatch.setattr(tmod, "_EMBEDDED_SCHEMA_PATH", real_schema_path)
+    receipt = t.enqueue(make_envelope())
+    assert receipt["event_id"].startswith("evt_")
+
+
+def test_enqueue_fails_closed_when_jsonschema_unusable(tmp_path, monkeypatch):
+    """Blocking regression (R3C round-3 #2, second half): a missing/unusable
+    ``jsonschema`` package previously degraded enqueue to the structural checks
+    (fail-open). Now the event is REJECTED: full Draft-2020-12 validation is
+    mandatory, so an unusable validator must never silently accept."""
+    t = make_transport(failing_sink(), tmp_path)
+    # Drop the cached validator so the import path is exercised on this call,
+    # then make `import jsonschema` fail (sys.modules entry None → ImportError).
+    monkeypatch.setattr(tmod, "_SCHEMA_VALIDATOR", None)
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    with pytest.raises(ValueError) as exc_info:
+        t.enqueue(make_envelope())
+    assert "fail-closed" in str(exc_info.value)
+    assert t.status()["journaled"] == 0
+    assert not (t.dir / "events.jsonl").exists()
+
+
 def test_turnstone_originated_envelope_requires_extensions(tmp_path):
     t = make_transport(failing_sink(), tmp_path)
     bad = make_envelope()
@@ -575,7 +792,9 @@ def test_turnstone_originated_envelope_requires_extensions(tmp_path):
 
 def test_pinned_schema_hash_matches():
     """Drift guard: the embedded envelope-shape boundary is pinned to the
-    ratified R-OBS-00 v1.0.0 schema copy (sha256 recorded at pin time)."""
+    ratified R-OBS-00 v1.0.0 schema copy (sha256 recorded at pin time). The
+    copy enqueue validates against at runtime (docs/telemetry/, shipped with
+    the plugin) must be byte-identical to that ratified copy."""
     import hashlib
 
     pinned = Path(tmod.PINNED_SCHEMA_PATH)
@@ -583,11 +802,17 @@ def test_pinned_schema_hash_matches():
         pytest.skip(f"pinned schema copy not present on this machine: {pinned}")
     digest = hashlib.sha256(pinned.read_bytes()).hexdigest()
     assert digest == tmod.PINNED_SCHEMA_SHA256
+    # The shipped runtime copy is byte-identical to the ratified copy.
+    embedded = Path(tmod._EMBEDDED_SCHEMA_PATH)
+    assert embedded.exists(), f"runtime schema copy missing: {embedded}"
+    assert hashlib.sha256(embedded.read_bytes()).hexdigest() == tmod.PINNED_SCHEMA_SHA256
     schema = json.loads(pinned.read_text(encoding="utf-8"))
     assert schema["version"] == "1.0.0" and schema["additionalProperties"] is False
     assert set(schema["required"]) == set(tmod.ENVELOPE_BASE_FIELDS)
     assert set(schema["properties"]) == set(tmod.ENVELOPE_SCHEMA_FIELDS)
     assert set(schema["properties"]["call_class"]["enum"]) == set(tmod.ENVELOPE_CALL_CLASSES)
+    # The repo enum the round-2 review pinned: "turnstone" or null, nothing else.
+    assert schema["properties"]["repo"]["enum"] == ["turnstone", None]
 
 
 # ---------------------------------------------------------------------------
@@ -623,35 +848,120 @@ def test_transport_store_lives_under_hermes_home(tmp_path):
     assert (t.dir / "events.jsonl").exists()
 
 
-def test_transport_journal_isolated_from_real_home(tmp_path):
+def test_transport_journal_isolated_from_real_home(tmp_path, monkeypatch):
     """TM isolation directive, transport edition: with BOTH HERMES_HOME and
     HERMES_TELEMETRY_HOME pinned to disposable roots, the journal must land
-    inside the disposable root and no real-home path (the developer's real
-    telemetry home / ~/.hermes) may be touched — no journal file there, and no
-    modification of pre-existing real-home files by enqueue + flush."""
+    inside the disposable root and the REAL telemetry home must never be
+    touched.
+
+    Deterministic decoy/interception proof (R3C round-3 #3) that never reads
+    live real-home state: EVERY file-open primitive the transport can reach is
+    intercepted for the duration of construction + enqueue + flush —
+    ``builtins.open``, ``io.open`` (what ``pathlib.Path.open/read_text/
+    read_bytes`` bottom out in — the seam the round-3 review showed bypassing
+    a builtins.open-only patch), ``os.open``, and the pathlib seams
+    themselves. The real-home comparison is purely lexical on captured path
+    strings (``Path.is_relative_to`` never touches the filesystem), and the
+    old "does a journal exist in the real home" existence probe is GONE — a
+    concurrent legitimate transport writer can no longer race this test."""
+    real_home = _REAL_TELEMETRY_HOME_NO_ENV
+    opened: list[tuple[str, str]] = []  # (primitive, path as opened)
+
+    real_builtins_open = builtins.open
+    real_io_open = io.open
+    real_os_open = os.open
+    real_path_open = pathlib.Path.open
+    real_path_read_text = pathlib.Path.read_text
+    real_path_read_bytes = pathlib.Path.read_bytes
+
+    def record(primitive: str, file: object) -> None:
+        try:
+            probe = Path(file)  # type: ignore[arg-type]
+        except TypeError:
+            return  # open(fd, ...) and other non-path handles
+        opened.append((primitive, str(probe)))
+
+    def guarded_builtins_open(file, mode="r", *args, **kwargs):
+        record("builtins.open", file)
+        return real_builtins_open(file, mode, *args, **kwargs)
+
+    def guarded_io_open(file, mode="r", *args, **kwargs):
+        record("io.open", file)
+        return real_io_open(file, mode, *args, **kwargs)
+
+    def guarded_os_open(path, flags, *args, **kwargs):
+        record("os.open", path)
+        return real_os_open(path, flags, *args, **kwargs)
+
+    def guarded_path_open(self, mode="r", *args, **kwargs):
+        record("Path.open", self)
+        return real_path_open(self, mode, *args, **kwargs)
+
+    def guarded_path_read_text(self, *args, **kwargs):
+        record("Path.read_text", self)
+        return real_path_read_text(self, *args, **kwargs)
+
+    def guarded_path_read_bytes(self, *args, **kwargs):
+        record("Path.read_bytes", self)
+        return real_path_read_bytes(self, *args, **kwargs)
+
+    # Pre-warm the cached Draft-2020-12 validator BEFORE the interception
+    # window: a cold `import jsonschema` inside the window would open module
+    # files through importlib machinery (open_code), which is not one of the
+    # open-primitive seams and would muddy the proof. After the warm-up the
+    # enqueue path performs no module imports.
+    tmod._jsonschema_violations(make_envelope())
+    assert tmod._SCHEMA_VALIDATOR is not None
+
+    monkeypatch.setattr(builtins, "open", guarded_builtins_open)
+    monkeypatch.setattr(io, "open", guarded_io_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
+    monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
+    monkeypatch.setattr(pathlib.Path, "read_text", guarded_path_read_text)
+    monkeypatch.setattr(pathlib.Path, "read_bytes", guarded_path_read_bytes)
+
     t = make_transport(failing_sink(), None)  # default dir resolution
     t.enqueue(make_envelope())
     t.flush()
+    # (monkeypatch restores every interception automatically; the env pins
+    # from the isolation fixtures are untouched.)
 
-    # 1. The journal lands inside the disposable pinned roots — nothing else.
-    assert Path(str(t.dir)).is_relative_to(tmp_path), f"journal left the disposable root: {t.dir}"
-    assert (t.dir / "events.jsonl").exists()
-    # 2. The REAL telemetry home (resolved with no env overrides at import
-    # time, i.e. the machine's actual home) was never touched: no transport
-    # journal appeared there, and pre-existing real files were not modified.
-    real_tele = _REAL_TELEMETRY_HOME_NO_ENV
-    real_transport = real_tele / "transport"
-    assert not (real_transport / "events.jsonl").exists(), (
-        f"transport journaled into the real home: {real_transport / 'events.jsonl'}"
+    # 1. The interception demonstrably covers the previously-bypassed seam:
+    #    enqueue MUST load the pinned schema (mandatory since FIX3) and that
+    #    load goes through Path.read_text → io.open. If no pathlib/io seam
+    #    recorded it, the proof itself would be incomplete — fail loudly.
+    schema_path = str(Path(tmod._EMBEDDED_SCHEMA_PATH))
+    schema_reads = {primitive for primitive, path in opened if path == schema_path}
+    assert schema_reads & {"Path.read_text", "Path.open", "io.open", "builtins.open"}, (
+        f"pinned-schema load not intercepted (proof incomplete): {schema_reads} vs {opened}"
     )
-    for probe_path, (existed, mtime_ns, size) in _REAL_HOME_PROBE_SNAPSHOT.items():
-        assert probe_path.exists() == existed, f"real-home file created during test: {probe_path}"
-        if existed:
-            assert probe_path.stat().st_mtime_ns == mtime_ns and (
-                probe_path.stat().st_size == size
-            ), f"real-home file modified during test: {probe_path}"
-    # 3. The pin target really is inside the disposable tmp root.
-    assert Path(str(t.dir)).is_relative_to(tmp_path)
+    journal_path = str(t.dir / "events.jsonl")
+    assert journal_path in {path for _, path in opened}, (
+        f"journal append not intercepted (proof incomplete): {opened}"
+    )
+
+    # 2. Every open the transport performed stayed inside the disposable tmp
+    #    root — the sole sanctioned exception is the read-only pinned schema
+    #    copy shipped with the repo — and none resolves under the REAL
+    #    telemetry home (lexical comparison only; no real-home filesystem
+    #    access, so a concurrent Hermes telemetry writer cannot race this).
+    real_home_touches = sorted({path for _, path in opened if Path(path).is_relative_to(real_home)})
+    assert real_home_touches == [], (
+        f"transport opened real-telemetry-home path(s): {real_home_touches}"
+    )
+    outside = sorted(
+        {
+            path
+            for _, path in opened
+            if not Path(path).is_relative_to(tmp_path) and path != schema_path
+        }
+    )
+    assert outside == [], f"transport opened path(s) outside the disposable root: {outside}"
+
+    # 3. The store resolved under the pinned disposable home (never the real
+    #    one) and the default transport dir resolves inside it as well.
+    assert Path(t.dir).is_relative_to(tmp_path), f"journal left the disposable root: {t.dir}"
+    assert (t.dir / "events.jsonl").exists()
     assert paths_mod.get_transport_dir().is_relative_to(tmp_path)
 
 

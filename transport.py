@@ -14,7 +14,9 @@ Fail-closed design (TM-pinned, HTB-B3):
    ``event_id``; sinks dedupe on it — see ``LocalFileSink``).
 3. Every failed delivery episode is recorded in ``outage_ledger.jsonl`` with
    the undelivered event ids and the staleness (age of the oldest pending
-   event). Nothing is ever dropped silently: if the sink is down, events stay
+   event); every later flush that still ends with pending records durably
+   refreshes the open episode (``update`` entries carry the current pending
+   set). Nothing is ever dropped silently: if the sink is down, events stay
    pending and are surfaced by ``status()`` / the ``/telemetry-status`` command.
 
 SINK INTERFACE (pinned; B4 exporters conform to this exact shape)::
@@ -49,9 +51,12 @@ before enqueue). ``enqueue`` enforces a concrete metadata-only boundary before
 journal append: the envelope must conform to the pinned R-OBS-00 v1.0.0 schema
 shape (see ``PINNED_SCHEMA_SHA256`` and ``_validate_envelope_shape``), must
 contain no unknown fields, and must not carry secret-shaped strings or
-prompt/response/file content sentinels in ANY field. Violations raise
-ValueError before journal append — nothing non-conforming is ever journaled
-or delivered.
+prompt/response/file content sentinels in ANY field. The full Draft-2020-12
+validation against the embedded pinned schema copy is MANDATORY and
+FAIL-CLOSED: a missing/unreadable schema copy or an unusable ``jsonschema``
+package rejects the event — it never silently degrades to the structural
+checks alone. Violations raise ValueError before journal append — nothing
+non-conforming is ever journaled or delivered.
 """
 
 from __future__ import annotations
@@ -62,6 +67,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +118,73 @@ PINNED_SCHEMA_SHA256 = "5271d5faa8bee8ad3d58885f4ab54f88d77af6e0620c78ba627665ca
 #: Path of the pinned schema copy whose hash is recorded above. Used only by a
 #: drift test (skipped when the copy is not present on the machine).
 PINNED_SCHEMA_PATH = "C:/tmp/sovav-hermes/r-obs-00/docs/telemetry/correlation-envelope.schema.json"
+
+#: Embedded pinned copy of correlation-envelope.schema.json (v1.0.0), shipped
+#: with the plugin at docs/telemetry/ and byte-identical to PINNED_SCHEMA_PATH
+#: (the drift test proves the byte equality via PINNED_SCHEMA_SHA256). This is
+#: the copy enqueue validates against at runtime — enforcement must not depend
+#: on a machine-specific path being present.
+_EMBEDDED_SCHEMA_PATH = (
+    Path(__file__).parent / "docs" / "telemetry" / "correlation-envelope.schema.json"
+)
+
+_SCHEMA_VALIDATOR_LOCK = threading.Lock()
+_SCHEMA_VALIDATOR: object | None = None
+
+
+def _pinned_schema() -> dict | None:
+    """Load the embedded pinned schema copy; None when missing/unreadable.
+
+    Callers MUST treat None as a fail-closed signal (see
+    ``_jsonschema_violations``): the boundary never degrades to best-effort.
+    """
+    try:
+        return json.loads(_EMBEDDED_SCHEMA_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _jsonschema_violations(envelope: dict) -> list[str]:
+    """FULL pinned-schema enforcement: Draft-2020-12 validation against the
+    embedded v1.0.0 copy (enums, types, minLength, allOf conditionals — the
+    complete schema semantics, not just property/required-set parity).
+
+    MANDATORY and FAIL-CLOSED: an unreadable/missing pinned copy or an
+    unusable ``jsonschema`` package returns violations — the event is
+    rejected, never silently accepted. The runtime dependency is declared in
+    pyproject.toml and installed by CI, so the usable path is the normal one;
+    anything that disables it must fail the enqueue, not bypass the pinned
+    schema (regression: tests/test_transport.py::test_enqueue_fails_closed_*).
+    """
+    schema = _pinned_schema()
+    if schema is None:
+        return [
+            "fail-closed: pinned schema copy unreadable or missing at "
+            f"{_EMBEDDED_SCHEMA_PATH} — event rejected rather than bypassing "
+            "the pinned v1.0.0 schema"
+        ]
+    global _SCHEMA_VALIDATOR
+    with _SCHEMA_VALIDATOR_LOCK:
+        if _SCHEMA_VALIDATOR is None:
+            try:
+                import jsonschema
+            except ImportError:
+                return [
+                    "fail-closed: jsonschema package unavailable — event rejected "
+                    "rather than bypassing full Draft-2020-12 validation (declare/"
+                    "install the dependency; see pyproject.toml)"
+                ]
+            try:
+                validator_cls = jsonschema.validators.validator_for(schema)
+                validator_cls.check_schema(schema)
+                _SCHEMA_VALIDATOR = validator_cls(schema)
+            except Exception as exc:  # noqa: BLE001 — fail closed on any validator failure
+                return [
+                    f"fail-closed: pinned schema validator unusable ({type(exc).__name__}: {exc})"
+                ]
+        errors = sorted(_SCHEMA_VALIDATOR.iter_errors(envelope), key=str)
+    return [f"schema violation: {err.message}" for err in errors]
+
 
 #: Full v1.0.0 property set (schema: additionalProperties false).
 ENVELOPE_SCHEMA_FIELDS = frozenset(
@@ -200,6 +273,45 @@ _SECRET_SHAPED_PATTERNS = tuple(
 #: redacting it down to metadata — reject before journaling.
 _CONTENT_SENTINEL_MARKERS = ("PROMPT_TEXT", "RESPONSE_TEXT", "FILE_CONTENT")
 
+# ---------------------------------------------------------------------------
+# Unicode default-ignorable normalization (mirrors the B1 redaction boundary:
+# redaction.py `_strip_default_ignorables`). Default-ignorable code points are
+# invisible in display but ARE part of the string value, so an attacker can
+# interleave them into a sentinel marker or secret (e.g. "PROM<U+200B>PT_TEXT")
+# to defeat raw shape matching. They are stripped BEFORE every sentinel and
+# secret-pattern check below. Cover: the Cf / Zl / Zp general categories plus
+# the default-ignorable outliers whose category is Lo / Mn / Cn.
+# ---------------------------------------------------------------------------
+
+_DEFAULT_IGNORABLE_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+
+_EXTRA_DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn)
+    (0x115F, 0x1160),  # HANGUL JUNGSEONG/JONGSEONG FILLER (Lo)
+    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ/AA (Mn)
+    (0x180B, 0x180D),  # MONGOLIAN FREE VARIATION SELECTOR ONE-THREE (Mn)
+    (0xFE00, 0xFE0F),  # VARIATION SELECTOR-1..16 (Mn)
+    (0x2065, 0x2065),  # unassigned, default-ignorable (Cn)
+    (0x3164, 0x3164),  # HANGUL FILLER (Lo)
+    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo)
+    (0xFFF0, 0xFFF8),  # unassigned, default-ignorable (Cn)
+    (0xE0000, 0xE0FFF),  # tag characters / variation selectors supplement (Cn)
+)
+
+
+def _is_default_ignorable(ch: str) -> bool:
+    if unicodedata.category(ch) in _DEFAULT_IGNORABLE_CATEGORIES:
+        return True
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _EXTRA_DEFAULT_IGNORABLE_RANGES)
+
+
+def _strip_default_ignorables(value: str) -> str:
+    """Remove every Unicode default-ignorable character from ``value``."""
+    if not value:
+        return value
+    return "".join(ch for ch in value if not _is_default_ignorable(ch))
+
 
 def _iter_string_values(value: object) -> Iterator[tuple[str, str]]:
     """Yield (path, string) for every string reachable inside ``value``."""
@@ -217,14 +329,23 @@ def _iter_string_values(value: object) -> Iterator[tuple[str, str]]:
 
 def _redaction_violations(envelope: dict) -> list[str]:
     """Banned-content scan: secret-shaped strings and content sentinels in any
-    field of the (allegedly already-redacted) envelope."""
+    field of the (allegedly already-redacted) envelope.
+
+    Every string (keys included) is canonicalized with
+    ``_strip_default_ignorables`` BEFORE matching, so default-ignorable Unicode
+    (e.g. a U+200B ZERO WIDTH SPACE inside "PROMPT_TEXT") cannot defeat the
+    scan — same boundary as the B1 redaction layer."""
     violations: list[str] = []
     for path, s in _iter_string_values(envelope):
+        # Strip default-ignorables FIRST; sentinels match case-insensitively,
+        # secret patterns keep their case-sensitive semantics on the raw case.
+        normalized = _strip_default_ignorables(s)
+        lowered = normalized.lower()
         for marker in _CONTENT_SENTINEL_MARKERS:
-            if marker.lower() in s.lower():
+            if marker.lower() in lowered:
                 violations.append(f"content sentinel {marker!r} in field value at {path!r}")
         for pattern in _SECRET_SHAPED_PATTERNS:
-            if pattern.search(s):
+            if pattern.search(normalized):
                 violations.append(f"secret-shaped string (pattern {pattern.pattern!r}) at {path!r}")
     return violations
 
@@ -282,6 +403,10 @@ def _validate_envelope_shape(envelope: dict) -> None:
     ):
         violations.append(f"field handoff_id must be str or null, got {handoff_id!r}")
     repo = envelope.get("repo")
+    if "repo" in envelope and repo not in ("turnstone", None):
+        violations.append(
+            f'field repo must be "turnstone" or null (pinned v1.0.0 enum), got {repo!r}'
+        )
     if repo == "turnstone":
         for req in _TURNSTONE_REQUIRED:
             val = envelope.get(req)
@@ -303,6 +428,10 @@ def _validate_envelope_shape(envelope: dict) -> None:
         if (isinstance(ht, str) and ht) != (isinstance(hr, str) and hr):
             violations.append("harness_task_id and harness_run_id must be carried together")
     violations.extend(_redaction_violations(envelope))
+    # Full pinned-schema enforcement (Draft-2020-12): catches every remaining
+    # schema semantic the structural checks above don't already cover (enums,
+    # types, minLength, the allOf Turnstone/harness conditionals).
+    violations.extend(_jsonschema_violations(envelope))
     if violations:
         raise ValueError(
             "envelope rejected before journal append (metadata-only boundary): "
@@ -689,33 +818,65 @@ class Transport:
                         return 0.0
         return 0.0
 
+    def _pending_event_ids(self) -> list[str]:
+        """Event ids of every record not yet accepted (cursor not advanced
+        past it)."""
+        with self._lock:
+            cursor = int(self._state["cursor_offset"])
+            return [rec.event_id for rec in self._journal_records if rec.start_offset >= cursor]
+
+    def _append_ledger(self, entry: dict) -> None:
+        with open(self.ledger_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":"), ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    def _outage_pending_fields(self) -> dict:
+        pending_ids = self._pending_event_ids()
+        return {
+            "pending_count": len(pending_ids),
+            "pending_event_ids": pending_ids[:LEDGER_EVENT_ID_CAP],
+            "pending_event_ids_truncated": len(pending_ids) > LEDGER_EVENT_ID_CAP,
+            "oldest_pending_age_seconds": round(self._oldest_pending_age(), 3),
+        }
+
     def _open_outage(self, kind: str, detail: str) -> str:
         episode_id = "ep_" + uuid.uuid4().hex[:12]
+        entry = {
+            "event": "open",
+            "episode_id": episode_id,
+            "ts": _utcnow_iso(),
+            "kind": kind,
+            "detail": detail,
+        }
+        entry.update(self._outage_pending_fields())
         with self._lock:
-            pending_ids = [
-                rec.event_id
-                for rec in self._journal_records
-                if rec.start_offset >= int(self._state["cursor_offset"])
-            ]
-            entry = {
-                "event": "open",
-                "episode_id": episode_id,
-                "ts": _utcnow_iso(),
-                "kind": kind,
-                "detail": detail,
-                "pending_count": len(pending_ids),
-                "pending_event_ids": pending_ids[:LEDGER_EVENT_ID_CAP],
-                "pending_event_ids_truncated": len(pending_ids) > LEDGER_EVENT_ID_CAP,
-                "oldest_pending_age_seconds": round(self._oldest_pending_age(), 3),
-            }
-            with open(self.ledger_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry, separators=(",", ":"), ensure_ascii=False) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
+            self._append_ledger(entry)
             self._state["open_episode"] = episode_id
             self._persist_state()
         logger.warning("transport: outage %s opened (%s): %s", episode_id, kind, detail)
         return episode_id
+
+    def _update_outage(self, kind: str, detail: str) -> None:
+        """Durable refresh of an ALREADY-OPEN outage episode: every flush that
+        ends with pending records while an episode is open appends an
+        ``update`` entry with the CURRENT pending ids/count/staleness (the
+        episode id is unchanged). Without this, work queued after the outage
+        opened would never appear in the ledger."""
+        with self._lock:
+            episode_id = self._state.get("open_episode")
+            if not episode_id:
+                return
+            entry = {
+                "event": "update",
+                "episode_id": episode_id,
+                "ts": _utcnow_iso(),
+                "kind": kind,
+                "detail": detail,
+            }
+            entry.update(self._outage_pending_fields())
+            self._append_ledger(entry)
+        logger.warning("transport: outage %s updated (%s): %s", episode_id, kind, detail)
 
     def _close_outage(self, delivered: int) -> None:
         with self._lock:
@@ -745,6 +906,7 @@ class Transport:
         last_ok = False
         partial = False
         attempt = 0
+        episode_opened_this_flush = False
         while True:
             with self._lock:
                 cursor = int(self._state["cursor_offset"])
@@ -784,20 +946,30 @@ class Transport:
                 break
             if self._state.get("open_episode") is None:
                 self._open_outage("sink_unavailable", last_detail)
+                episode_opened_this_flush = True
             self._sleep(min(self.max_delay_s, self.base_delay_s * (2 ** (attempt - 1))))
         pending = self._journaled - int(self._state["delivered_count"])
-        if pending > 0 and self._state.get("open_episode") is None:
+        if pending > 0:
             # Fail-closed invariant (module docstring §3): EVERY flush that
-            # ends with pending records must durably open/update the outage
+            # ends with pending records must durably open OR UPDATE the outage
             # ledger — including one-attempt failure (max_retries=1),
-            # ok-but-nothing-accepted, and partial accept. No silent outage.
+            # ok-but-nothing-accepted, and partial accept, and including an
+            # episode that is ALREADY open from an earlier flush (the open
+            # entry must be refreshed with the current pending set, never left
+            # stale). No silent outage.
             if partial:
                 kind = "partial_accept_pending"
             elif last_ok:
                 kind = "sink_accepted_none"
             else:
                 kind = "sink_unavailable"
-            self._open_outage(kind, last_detail or "flush ended with pending records")
+            detail = last_detail or "flush ended with pending records"
+            if self._state.get("open_episode") is None:
+                self._open_outage(kind, detail)
+            elif not episode_opened_this_flush:
+                # The episode was opened by an EARLIER flush; new pending work
+                # exists, so the durable record must be refreshed.
+                self._update_outage(kind, detail)
         return {
             "ok": pending == 0,
             "attempts": attempts_used,

@@ -1,0 +1,460 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:sovav-hermes:telemetry:correlation-envelope:1.0.0",
+  "title": "Shared telemetry correlation envelope",
+  "description": "One correlation envelope propagated everywhere by both the sovav-hermes harness and Turnstone instrumentation. Base fields are required on every envelope. The Turnstone extension fields and the harness-origin propagation fields (harness_task_id/harness_run_id) are required on Turnstone-originated events (repo == \"turnstone\") and must be null when present otherwise. Cross-repo join key: trace_id + correlation_id. In-repo join key: task_id + run_id. Canonical owner: sovav-hermes (turnstone companion plan D8); Turnstone pins a copy at fixtures/telemetry/correlation-envelope.schema.json with a drift test. Do not edit unilaterally; changes flow through the paired plan.",
+  "version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "board": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Board slug of the originating card, e.g. sovav-hermes or turnstone."
+    },
+    "task_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Board task id of the card being worked, e.g. t_2731ee50."
+    },
+    "run_id": {
+      "type": [
+        "integer",
+        "string"
+      ],
+      "description": "Dispatch/run identifier of the emitting run. Hermes run ids are integers; emitters MAY serialize them as strings. Consumers compare run ids as strings."
+    },
+    "parent_task_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "Parent card ids of task_id; empty array when the card has no parents."
+    },
+    "profile/role": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Emitting Hermes profile, which is also the role (operator, pm, tm, worker, reviewer). The default/Hermes key is interactive human use only; autonomous spend on it is an attribution red flag."
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider-qualified model id as invoked, e.g. z-ai/glm-5.3-flash."
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Model provider id, e.g. openrouter or anthropic."
+    },
+    "key_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "NON-SECRET credential label (key name or hash prefix). NEVER a key value."
+    },
+    "call_class": {
+      "type": "string",
+      "enum": [
+        "primary",
+        "fallback",
+        "aux",
+        "delegate",
+        "judge",
+        "cron"
+      ],
+      "description": "Call path class of the attributed call."
+    },
+    "handoff_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Handoff/transition identifier when the event is part of a handoff; null otherwise."
+    },
+    "worktree/branch": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Git branch the run executed on, identifying the isolated worktree, e.g. r-obs-00."
+    },
+    "trace_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Cross-repo trace identifier. One half of the cross-repo join key (trace_id + correlation_id)."
+    },
+    "repo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "turnstone",
+        null
+      ],
+      "description": "Marks the event as Turnstone-originated (\"turnstone\"). Null or absent on harness-originated events."
+    },
+    "agent_run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Turnstone AgentRun identifier."
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Turnstone correlation identifier. Other half of the cross-repo join key."
+    },
+    "idempotency_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Duplicate-export idempotency key; duplicate export of the same agent_run_id + correlation_id is idempotent."
+    },
+    "deal_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Opaque internal id (newId(\"deal\")) - safe metadata per companion D2."
+    },
+    "worker_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Turnstone worker identifier."
+    },
+    "model_ref": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The worker definition's model reference."
+    },
+    "trigger_type": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Run trigger type per the Turnstone trigger policy (automatic triggers stay disabled; production posture 1% manual-only, eval-gated)."
+    },
+    "runtime_environment": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "dev",
+        "staging",
+        "production",
+        null
+      ],
+      "description": "From WorkerRunContract.runtime_environment (companion D4); drives the Sentry environment tag."
+    },
+    "basis_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Basis fingerprint; explicitly export-approved metadata (companion D3)."
+    },
+    "worker_definition_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Version of the worker definition that ran."
+    },
+    "output_schema_version": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Version of the output schema the worker was contract-bound to."
+    },
+    "harness_task_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Populated from the TURNSTONE_HARNESS_TASK_ID env var when a Turnstone run originates from a harness card; null otherwise. Carried together with harness_run_id."
+    },
+    "harness_run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Populated from the TURNSTONE_HARNESS_RUN_ID env var when a Turnstone run originates from a harness card; null otherwise. Carried together with harness_task_id."
+    }
+  },
+  "required": [
+    "board",
+    "task_id",
+    "run_id",
+    "parent_task_ids",
+    "profile/role",
+    "model",
+    "provider",
+    "key_id",
+    "call_class",
+    "handoff_id",
+    "worktree/branch",
+    "trace_id"
+  ],
+  "allOf": [
+    {
+      "$comment": "Required-set convention: base fields are always required (top-level required); the Turnstone extension set plus harness_task_id/harness_run_id is additionally required on Turnstone-originated events, where every Turnstone extension field is also narrowed to its non-null type (identifiers must be non-empty; runtime_environment keeps its non-null enum). Off Turnstone the extensions stay nullable/absent; harness_task_id/harness_run_id stay nullable with the pair-consistency rule.",
+      "if": {
+        "properties": {
+          "repo": {
+            "const": "turnstone"
+          }
+        },
+        "required": [
+          "repo"
+        ]
+      },
+      "then": {
+        "required": [
+          "repo",
+          "agent_run_id",
+          "correlation_id",
+          "idempotency_key",
+          "deal_id",
+          "worker_id",
+          "model_ref",
+          "trigger_type",
+          "runtime_environment",
+          "basis_fingerprint",
+          "worker_definition_version",
+          "output_schema_version",
+          "harness_task_id",
+          "harness_run_id"
+        ],
+        "properties": {
+          "agent_run_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "correlation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "deal_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "worker_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "model_ref": {
+            "type": "string",
+            "minLength": 1
+          },
+          "trigger_type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "runtime_environment": {
+            "type": "string",
+            "enum": [
+              "dev",
+              "staging",
+              "production"
+            ]
+          },
+          "basis_fingerprint": {
+            "type": "string",
+            "minLength": 1
+          },
+          "worker_definition_version": {
+            "type": "string",
+            "minLength": 1
+          },
+          "output_schema_version": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "$comment": "On non-Turnstone (harness-originated) events, every Turnstone extension field and harness propagation field, when present, must be null.",
+      "if": {
+        "not": {
+          "properties": {
+            "repo": {
+              "const": "turnstone"
+            }
+          },
+          "required": [
+            "repo"
+          ]
+        }
+      },
+      "then": {
+        "properties": {
+          "repo": {
+            "type": "null"
+          },
+          "agent_run_id": {
+            "type": "null"
+          },
+          "correlation_id": {
+            "type": "null"
+          },
+          "idempotency_key": {
+            "type": "null"
+          },
+          "deal_id": {
+            "type": "null"
+          },
+          "worker_id": {
+            "type": "null"
+          },
+          "model_ref": {
+            "type": "null"
+          },
+          "trigger_type": {
+            "type": "null"
+          },
+          "runtime_environment": {
+            "type": "null"
+          },
+          "basis_fingerprint": {
+            "type": "null"
+          },
+          "worker_definition_version": {
+            "type": "null"
+          },
+          "output_schema_version": {
+            "type": "null"
+          },
+          "harness_task_id": {
+            "type": "null"
+          },
+          "harness_run_id": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Consistency rule: harness_task_id and harness_run_id are carried together (both non-null or both null).",
+      "if": {
+        "properties": {
+          "harness_task_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "harness_task_id"
+        ]
+      },
+      "then": {
+        "required": [
+          "harness_run_id"
+        ],
+        "properties": {
+          "harness_run_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "harness_run_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "harness_run_id"
+        ]
+      },
+      "then": {
+        "required": [
+          "harness_task_id"
+        ],
+        "properties": {
+          "harness_task_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  ],
+  "examples": [
+    {
+      "board": "sovav-hermes",
+      "task_id": "t_2731ee50",
+      "run_id": 55,
+      "parent_task_ids": [],
+      "profile/role": "worker",
+      "model": "z-ai/glm-5.3-flash",
+      "provider": "openrouter",
+      "key_id": "label:worker-openrouter-a",
+      "call_class": "primary",
+      "handoff_id": null,
+      "worktree/branch": "r-obs-00",
+      "trace_id": "trc_01h9exampleexampleexample",
+      "repo": null,
+      "agent_run_id": null,
+      "correlation_id": null,
+      "idempotency_key": null,
+      "deal_id": null,
+      "worker_id": null,
+      "model_ref": null,
+      "trigger_type": null,
+      "runtime_environment": null,
+      "basis_fingerprint": null,
+      "worker_definition_version": null,
+      "output_schema_version": null,
+      "harness_task_id": null,
+      "harness_run_id": null
+    },
+    {
+      "board": "turnstone",
+      "task_id": "t_09c3a2d3",
+      "run_id": "run_42",
+      "parent_task_ids": [
+        "t_2731ee50"
+      ],
+      "profile/role": "worker",
+      "model": "z-ai/glm-5.3-flash",
+      "provider": "openrouter",
+      "key_id": "label:turnstone-openrouter-a",
+      "call_class": "primary",
+      "handoff_id": "h_0001",
+      "worktree/branch": "wt/t-obs-01",
+      "trace_id": "trc_01h9exampleexampleexample",
+      "repo": "turnstone",
+      "agent_run_id": "ar_00112233",
+      "correlation_id": "corr_00112233",
+      "idempotency_key": "ar_00112233:corr_00112233",
+      "deal_id": "deal_0099",
+      "worker_id": "w_review_agent",
+      "model_ref": "openai/gpt-5.6-sol",
+      "trigger_type": "manual",
+      "runtime_environment": "dev",
+      "basis_fingerprint": "bfp_5f4e3d2c",
+      "worker_definition_version": "1.2.0",
+      "output_schema_version": "1.0.0",
+      "harness_task_id": "t_2731ee50",
+      "harness_run_id": "55"
+    }
+  ]
+}
