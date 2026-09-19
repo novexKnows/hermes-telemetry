@@ -300,10 +300,12 @@ class SentryExporter(Sink):
     envelope verbatim. Credential: ``SENTRY_DSN`` env var (§3.4) — the store
     endpoint derives from the DSN itself, never a separate host config.
 
-    VERIFICATION STATUS (HTB-B4): the LangSmith leg is verified end-to-end
-    against the live sandbox; the Sentry leg is credential-gated (no
-    SENTRY_DSN provisioned), so this exporter is mock-tested only and its
-    integration test skips without a DSN. ``sentry_verified`` is NOT claimed.
+    VERIFICATION STATUS (HTB-B4b): VERIFIED live end-to-end. Sandbox project
+    ``sovav-hermes-sandbox`` (org ``sovav``), real store-endpoint ingestion of
+    metadata-only envelopes, and authenticated API read-back per event — see
+    ``docs/telemetry/sandbox-flow.md`` for commands and evidence. The
+    integration tests below run the same flow skip-gated on ``SENTRY_DSN`` +
+    ``SENTRY_AUTH_TOKEN``.
     """
 
     DEFAULT_ENV_DSN = "SENTRY_DSN"

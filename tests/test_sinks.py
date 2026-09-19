@@ -31,6 +31,9 @@ CREDENTIAL_ENV_VARS = [
     "LANGSMITH_PROJECT",
     "LANGCHAIN_PROJECT",
     "SENTRY_DSN",
+    "SENTRY_AUTH_TOKEN",
+    "SENTRY_ORG",
+    "SENTRY_PROJECT",
 ]
 
 # Sentinel markers (telemetry-contract.md §3.3 redaction-leakage scan): if any
@@ -428,3 +431,123 @@ def test_integration_langsmith_readback_is_metadata_only(
     serialized = json.dumps(run.dict(), default=str)
     for marker in MARKERS:
         assert marker not in serialized
+
+
+# ---------------------------------------------------------------------------
+# Sentry integration — real sandbox leg (skip without credentials; NEVER
+# fabricated). Read-back uses the authenticated Sentry API (SENTRY_AUTH_TOKEN)
+# and joins on the deterministic per-event Sentry event id the exporter uses.
+# Ingest processing is asynchronous (observed up to ~60s), so read-back polls.
+# ---------------------------------------------------------------------------
+
+SENTRY_API = "https://sentry.io/api/0"
+SENTRY_READBACK_DEADLINE_S = 120.0
+SENTRY_READBACK_POLL_S = 10.0
+
+
+def _sentry_event_id_for(event_id: str) -> str:
+    """The Sentry event id the exporter assigned for a transport event id."""
+    return sinks.langsmith_run_id_for_event(event_id).replace("-", "")
+
+
+def _sentry_api_get(path: str, token: str) -> tuple[int, object]:
+    from urllib import request as urlreq
+
+    req = urlreq.Request(f"{SENTRY_API}{path}", headers={"Authorization": f"Bearer {token}"})
+    with urlreq.urlopen(req, timeout=15) as resp:
+        return int(resp.status), json.load(resp)
+
+
+def _has_ambient_sentry_creds(ambient: dict) -> bool:
+    return bool(ambient.get("SENTRY_DSN")) and bool(ambient.get("SENTRY_AUTH_TOKEN"))
+
+
+def _poll_sentry_event(token: str, org: str, project: str, sentry_event_id: str) -> dict:
+    """Poll the per-event read-back until it appears (or DeadlineExceeded)."""
+    import time
+
+    deadline = time.monotonic() + SENTRY_READBACK_DEADLINE_S
+    from urllib import error as urlerror
+
+    while time.monotonic() < deadline:
+        try:
+            status, body = _sentry_api_get(
+                f"/projects/{org}/{project}/events/{sentry_event_id}/", token
+            )
+        except urlerror.HTTPError as exc:
+            if exc.code == 404:  # not yet processed — keep polling
+                time.sleep(SENTRY_READBACK_POLL_S)
+                continue
+            raise
+        assert status == 200
+        return body
+    raise AssertionError(
+        f"event {sentry_event_id} not readable after {SENTRY_READBACK_DEADLINE_S:.0f}s"
+    )
+
+
+def test_integration_sentry_sandbox_end_to_end(credential_env_snapshot_and_clear, monkeypatch):
+    """Real metadata-only sandbox flow: deliver -> API read-back proves arrival.
+
+    Requires SENTRY_DSN + SENTRY_AUTH_TOKEN in the ambient env (sandbox project
+    sovav-hermes-sandbox; SENTRY_ORG / SENTRY_PROJECT override the slugs).
+    Skips (not fails) without credentials — the no-fabrication gate.
+    """
+    ambient = credential_env_snapshot_and_clear
+    if not _has_ambient_sentry_creds(ambient):
+        pytest.skip("no Sentry credentials in ambient env (SENTRY_DSN / SENTRY_AUTH_TOKEN absent)")
+    for name, value in ambient.items():
+        monkeypatch.setenv(name, value)
+
+    org = os.environ.get("SENTRY_ORG") or "sovav"
+    project = os.environ.get("SENTRY_PROJECT") or "sovav-hermes-sandbox"
+    events = [make_event(9101), make_event(9102)]
+
+    exp = sinks.SentryExporter()  # reads SENTRY_DSN from env
+    assert exp.configured
+    result = exp.deliver(events)
+    assert result["ok"] is True, result["detail"]
+    assert result["accepted"] == 2
+
+    token = os.environ["SENTRY_AUTH_TOKEN"]
+    for event in events:
+        body = _poll_sentry_event(token, org, project, _sentry_event_id_for(event["event_id"]))
+        assert body["eventID"] == _sentry_event_id_for(event["event_id"])
+        assert body["title"] == sinks.SentryExporter.RUN_MESSAGE
+        tags = {t["key"]: t["value"] for t in body["tags"]}
+        # Envelope round-trips verbatim into tags (§1.6 slash normalization).
+        assert tags["profile_role"] == "worker"
+        assert tags["worktree_branch"] == "wt/htb-b4"
+        assert tags["task_id"] == "t_763d8d58"
+        assert tags["event_id"] == event["event_id"]
+        assert tags["run_id"] == "11"
+
+
+def test_integration_sentry_readback_is_metadata_only(
+    credential_env_snapshot_and_clear, monkeypatch
+):
+    """Negative redaction scan over the REAL read-back payloads (§3.3)."""
+    ambient = credential_env_snapshot_and_clear
+    if not _has_ambient_sentry_creds(ambient):
+        pytest.skip("no Sentry credentials in ambient env (SENTRY_DSN / SENTRY_AUTH_TOKEN absent)")
+    for name, value in ambient.items():
+        monkeypatch.setenv(name, value)
+
+    org = os.environ.get("SENTRY_ORG") or "sovav"
+    project = os.environ.get("SENTRY_PROJECT") or "sovav-hermes-sandbox"
+    event = make_event(9103)
+
+    exp = sinks.SentryExporter()
+    result = exp.deliver([event])
+    assert result["ok"] is True, result["detail"]
+
+    token = os.environ["SENTRY_AUTH_TOKEN"]
+    body = _poll_sentry_event(token, org, project, _sentry_event_id_for(event["event_id"]))
+    # No prompt/response/tool-result material anywhere in the round-tripped event.
+    serialized = json.dumps(body, default=str)
+    for marker in MARKERS:
+        assert marker not in serialized
+    # The verbatim envelope lives in the event context, tagged metadata only.
+    context = body.get("context") or {}
+    assert context["envelope"]["profile/role"] == "worker"
+    assert context["envelope"]["worktree/branch"] == "wt/htb-b4"
