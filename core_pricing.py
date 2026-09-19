@@ -103,6 +103,17 @@ def resolve(model: str, provider: str = "", base_url: str = "") -> dict | None:
 
         snap["source_url"] = getattr(entry, "source_url", None)
         snap["pricing_version"] = getattr(entry, "pricing_version", None)
+        # Context-tiered (long-context) pricing: the threshold above which the
+        # tariff's *_above rates replace the base rates for the whole request
+        # (Google semantics). None when the tariff is not tiered. Purely
+        # informational — record_pricing_snapshot stores only the *_per_million
+        # columns, and _pricing_snapshot_changed ignores unknown keys; the
+        # capture path reads it to flag llm_calls.long_context_override.
+        tier = getattr(entry, "tier_threshold_tokens", None)
+        try:
+            snap["tier_threshold_tokens"] = int(tier) if tier is not None else None
+        except (TypeError, ValueError):
+            snap["tier_threshold_tokens"] = None
         fetched_at = getattr(entry, "fetched_at", None)
         snap["fetched_at"] = fetched_at.isoformat() if fetched_at is not None else None
         return snap

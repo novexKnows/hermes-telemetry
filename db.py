@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover - db.py loaded standalone (no package co
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = 16
+_SCHEMA_VERSION = 17
 _local = threading.local()
 
 # Serializes first-time schema setup across threads. Each thread opens its own
@@ -177,6 +177,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     _migrate_v14(conn)
     _migrate_v15(conn)
     _migrate_v16(conn)
+    _migrate_v17(conn)
 
 
 def _migrate_v2(conn: sqlite3.Connection) -> None:
@@ -630,6 +631,52 @@ def _migrate_v16(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v17(conn: sqlite3.Connection) -> None:
+    """Add nullable observation columns to ``llm_calls`` (v17).
+
+    Minimum observation fields captured from hook payloads — all nullable,
+    purely additive (``_add_column_if_missing``), no destructive schema change:
+
+    - Kanban board/task/run IDs: which board/task/run the call belonged to
+      (task_id from the hook kwargs, board/run from the kanban env vars).
+    - retry_count / api_request_id: the gateway request id and how many
+      ``api_request_error`` retries preceded this successful call.
+    - upstream_provider / provider_generation_id: the upstream provider and
+      generation id the gateway reports on the response (exposed by the
+      ``post_api_request`` hook's sanitized ``response`` payload).
+    - billed_cost_usd / billing_source / billing_status: the provider-reported
+      billed cost and where/whether that number came from. NULL when the
+      provider did not report a cost and the row carries only the estimate.
+    - long_context_override: 1 when the tariff's context-tier (long-context)
+      above-rates applied to this request (prompt tokens exceeded the tier
+      threshold), 0 when a tiered tariff is known and the threshold was NOT
+      exceeded, NULL when no tiered tariff is known for the model.
+    """
+    cur = conn.execute("SELECT version FROM schema_version WHERE version = 17")
+    if cur.fetchone() is not None:
+        return
+
+    for col, typedef in (
+        ("kanban_board", "TEXT"),
+        ("kanban_task", "TEXT"),
+        ("kanban_run", "TEXT"),
+        ("retry_count", "INTEGER"),
+        ("api_request_id", "TEXT"),
+        ("upstream_provider", "TEXT"),
+        ("provider_generation_id", "TEXT"),
+        ("billed_cost_usd", "REAL"),
+        ("billing_source", "TEXT"),
+        ("billing_status", "TEXT"),
+        ("long_context_override", "INTEGER"),
+    ):
+        _add_column_if_missing(conn, "llm_calls", col, typedef)
+
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (17, ?)",
+        (_utcnow(),),
+    )
+
+
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -715,6 +762,17 @@ def record_llm_call(
     estimated: bool = False,
     provider_assumed: bool = False,
     moa_preset: str | None = None,
+    kanban_board: str | None = None,
+    kanban_task: str | None = None,
+    kanban_run: str | None = None,
+    retry_count: int | None = None,
+    api_request_id: str | None = None,
+    upstream_provider: str | None = None,
+    provider_generation_id: str | None = None,
+    billed_cost_usd: float | None = None,
+    billing_source: str | None = None,
+    billing_status: str | None = None,
+    long_context_override: int | None = None,
 ) -> None:
     conn = _get_conn()
     conn.execute(
@@ -722,8 +780,12 @@ def record_llm_call(
         INSERT INTO llm_calls
             (session_id, ts, model, provider, tokens_in, tokens_out, cost_usd, latency_ms,
              cache_read_tokens, cache_write_tokens, reasoning_tokens, estimated,
-             provider_assumed, moa_preset)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             provider_assumed, moa_preset,
+             kanban_board, kanban_task, kanban_run, retry_count, api_request_id,
+             upstream_provider, provider_generation_id, billed_cost_usd,
+             billing_source, billing_status, long_context_override)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             session_id,
@@ -740,6 +802,17 @@ def record_llm_call(
             1 if estimated else 0,
             1 if provider_assumed else 0,
             moa_preset,
+            kanban_board,
+            kanban_task,
+            kanban_run,
+            retry_count,
+            api_request_id,
+            upstream_provider,
+            provider_generation_id,
+            billed_cost_usd,
+            billing_source,
+            billing_status,
+            long_context_override,
         ),
     )
     _ensure_run_row(session_id, ts)

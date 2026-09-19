@@ -279,6 +279,35 @@ def test_reasoning_tokens_billed_as_output():
     assert abs(cost - expected) < 1e-10
 
 
+def test_reasoning_not_double_charged_with_output():
+    """reasoning_tokens are a subset of billed output in Hermes/OpenRouter
+    usage, so they must NOT be charged in addition to output_tokens.
+
+    Hermes/OpenRouter report reasoning (thinking) tokens inside the billed
+    completion/output total. Charging `output * output_price` AND
+    `reasoning * reasoning_price` therefore bills the reasoning tokens twice.
+    Regression: a call with 10k output tokens of which 4k were reasoning must
+    cost exactly 10k at the output rate — not 14k.
+    """
+    usage = {"output_tokens": 10_000, "reasoning_tokens": 4_000}
+    cost = pricing.estimate_cost(usage, "claude-sonnet-4-6")
+    expected = 10_000 * 15.00 / 1_000_000
+    assert abs(cost - expected) < 1e-10, (
+        f"reasoning tokens double-charged: expected {expected}, got {cost}"
+    )
+
+
+def test_reasoning_excess_beyond_output_still_billed():
+    """Defensive: if a usage dict ever reports reasoning_tokens above
+    output_tokens (provider reporting reasoning outside the completion
+    total), the excess is still billed at the reasoning rate so the call
+    is not silently under-counted."""
+    usage = {"output_tokens": 10_000, "reasoning_tokens": 12_000}
+    cost = pricing.estimate_cost(usage, "claude-sonnet-4-6")
+    expected = (10_000 * 15.00 + 2_000 * 15.00) / 1_000_000
+    assert abs(cost - expected) < 1e-10
+
+
 def test_estimate_cost_empty_usage():
     """`estimate_cost({}, model)` should return 0.0."""
     assert pricing.estimate_cost({}, "claude-sonnet-4-6") == 0.0

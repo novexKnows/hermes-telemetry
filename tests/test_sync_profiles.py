@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 import hermes_telemetry.sync_profiles as sp
 
 # --- Task 1: path/env helpers ---
@@ -124,7 +126,15 @@ def test_plugin_status_detects_install_via_symlink(tmp_path):
     real.mkdir()
     plugins = tmp_path / "plugins"
     plugins.mkdir()
-    (plugins / "hermes-telemetry").symlink_to(real, target_is_directory=True)
+    try:
+        (plugins / "hermes-telemetry").symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        # Creating a directory symlink on Windows needs administrator or
+        # Developer Mode (WinError 1314, ERROR_PRIVILEGE_NOT_HELD) and some
+        # filesystems/platforms don't support symlinks at all. Skip only when
+        # the capability itself is missing — where symlinks work, the full
+        # assertion below still runs.
+        pytest.skip(f"directory symlinks unavailable here: {exc}")
     state, installed = sp.plugin_status(tmp_path)
     assert (state, installed) == ("enabled", True)
 

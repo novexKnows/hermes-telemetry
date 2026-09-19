@@ -1434,7 +1434,11 @@ def test_migrate_v10_adds_columns_from_wedged_v9(monkeypatch):
     conn.execute("DROP TABLE _runs_old")
 
     # Remove the v10 marker so the migration re-runs on the next connect.
+    # v17 too: record_llm_call now writes the v17 observation columns, so the
+    # wedged-DB rebuild (which predates every post-v9 migration) must re-run
+    # v17 as well or the round-trip below would hit 'no column named kanban_board'.
     conn.execute("DELETE FROM schema_version WHERE version = 10")
+    conn.execute("DELETE FROM schema_version WHERE version = 17")
 
     llm_cols = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info('llm_calls')")}
     runs_cols = {r[0] for r in conn.execute("SELECT name FROM pragma_table_info('runs')")}

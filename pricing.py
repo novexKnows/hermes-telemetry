@@ -560,12 +560,18 @@ def estimate_cost(
                 model,
             )
 
+    # Reasoning tokens are a SUBSET of billed output in Hermes/OpenRouter
+    # usage (the completion total already includes thinking tokens), so they
+    # must not be charged in addition to output_tokens. Only bill reasoning
+    # that is reported ABOVE the output total (defensive: a provider that
+    # reports reasoning outside the completion total would otherwise be
+    # under-counted). See tests/test_pricing.py::test_reasoning_not_double_charged_with_output.
     cost = (
         input_tokens * prices["input"]
         + output_tokens * prices["output"]
         + cache_read_tok * prices["cache_read"]
         + cache_write_tok * prices["cache_write"]
-        + reasoning_tok * prices["reasoning"]
+        + max(0, reasoning_tok - output_tokens) * prices["reasoning"]
     ) / 1_000_000
 
     return cost

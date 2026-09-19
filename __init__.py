@@ -49,6 +49,18 @@ _pending_free_paid_lock = threading.Lock()
 _pending_model_unavailable_alerts: dict[str, tuple[str, str, int, int]] = {}
 _pending_model_unavailable_lock = threading.Lock()
 
+# Retry accounting (v17 observation fields). api_request_error increments the
+# per-session counter; the next successful post_api_request records it as
+# llm_calls.retry_count and clears it. NULL ⇒ no error was observed since the
+# session's previous successful call.
+_retry_counts: dict[str, int] = {}
+_retry_counts_lock = threading.Lock()
+
+# Long-context (context-tiered) pricing thresholds, (provider, model) →
+# tier_threshold_tokens | None. Populated by the pricing-snapshot capture in
+# post_api_request; used to flag llm_calls.long_context_override per call.
+_tier_thresholds: dict[tuple[str, str], int | None] = {}
+
 # Characters per token estimate (used when usage=None)
 _CHARS_PER_TOKEN = 4
 
@@ -240,7 +252,10 @@ def register(ctx) -> None:  # noqa: ANN001
     # Fired after each individual API call within a turn.
     # kwargs: session_id, model, provider, api_duration (seconds),
     #         usage (dict with input_tokens/output_tokens or None),
-    #         api_call_count, assistant_content_chars
+    #         api_call_count, assistant_content_chars, task_id, turn_id,
+    #         api_request_id, response (sanitized response payload: model,
+    #         finish_reason, assistant_message, usage, and — when the core
+    #         exposes them — id/provider/billed_cost_usd)
     # ------------------------------------------------------------------
     def post_api_request(
         session_id: str = "",
@@ -381,27 +396,67 @@ def register(ctx) -> None:  # noqa: ANN001
                     session_id,
                 )
 
-            db.record_llm_call(
-                session_id=session_id,
-                ts=_utcnow(),
-                model=effective_model,
-                provider=provider,
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
-                cost_usd=cost,
-                latency_ms=latency_ms,
-                cache_read_tokens=cache_read_tok,
-                cache_write_tokens=cache_write_tok,
-                reasoning_tokens=reasoning_tok,
-                estimated=estimated,
-                provider_assumed=provider_assumed,
-                moa_preset=moa_preset,
-            )
+            # Observation fields (v17): capture what the hook payload and the
+            # kanban environment expose about this call. Everything is nullable
+            # and fail-open — a missing field stays NULL in the row.
+            api_request_id = str(_kw.get("api_request_id") or "") or None
+            response_payload = _kw.get("response")
+            provider_generation_id = None
+            upstream_provider = None
+            billed_cost_usd = None
+            billing_source = None
+            billing_status = None
+            if isinstance(response_payload, dict):
+                provider_generation_id = (
+                    str(response_payload.get("id") or "") or None
+                )
+                upstream_provider = (
+                    str(response_payload.get("provider") or "") or None
+                )
+                raw_billed = response_payload.get("billed_cost_usd")
+                if raw_billed is not None:
+                    try:
+                        billed_cost_usd = float(raw_billed)
+                    except (TypeError, ValueError):
+                        billed_cost_usd = None
+                billing_source = str(response_payload.get("billing_source") or "") or None
+                billing_status = str(response_payload.get("billing_status") or "") or None
+            if billed_cost_usd is not None and not billing_source:
+                billing_source = "provider"  # the hook only exposes provider-reported costs
+            if billed_cost_usd is not None and not billing_status:
+                billing_status = "reported"
+
+            # Kanban identity: ONLY the env vars the kanban dispatcher exports
+            # (hermes_cli/kanban_db_dispatch.py sets HERMES_KANBAN_TASK /
+            # HERMES_KANBAN_RUN_ID / HERMES_KANBAN_BOARD for the worker process).
+            # The hook's task_id kwarg is deliberately NOT used: run_conversation
+            # generates a per-turn UUID there when no task was supplied
+            # (agent/turn_context.py), which is not a Kanban card id — a
+            # generated UUID must never overwrite the dispatcher's card id.
+            # Outside a Kanban worker all three stay NULL.
+            kanban_task = os.environ.get("HERMES_KANBAN_TASK")
+            kanban_board = os.environ.get("HERMES_KANBAN_BOARD")
+            kanban_run = os.environ.get("HERMES_KANBAN_RUN_ID")
+            with _retry_counts_lock:
+                retry_count = _retry_counts.pop(session_id, None)
+
+            # Long-context (context-tiered) pricing override: 1 when this
+            # request's prompt tokens exceeded the tariff's tier threshold
+            # (the *_above long-context rates replaced the base rates for the
+            # whole request), 0 when a tiered tariff is known and the threshold
+            # was NOT exceeded, NULL when no tiered tariff is known yet.
+            # Computed AFTER the pricing snapshot below so the first
+            # (cold-cache) call for a (provider, model) already sees the
+            # freshly resolved tier threshold instead of storing NULL.
+            prompt_tokens = tokens_in + cache_read_tok + cache_write_tok
 
             # Pricing snapshot (v14): capture the core-resolved tariff + provenance
             # for this (provider, model), throttled to ~once per TTL per process.
-            # Own guard so a pricing failure never affects the call recorded above
+            # Own guard so a pricing failure never affects the call recorded below
             # or the agent turn. See ONBOARDING.md § Core-sourced pricing snapshots.
+            # A fresh resolve here also lands the tariff's context-tier threshold
+            # in _tier_thresholds for the row recorded in this very call (and for
+            # subsequent calls by the same (provider, model)).
             if effective_model:
                 _snap_key = (provider, effective_model)
                 _snap_now = time.monotonic()
@@ -425,8 +480,46 @@ def register(ctx) -> None:  # noqa: ANN001
                                 api_mode,
                                 resolved_model=_resolved,
                             )
+                            with _pricing_snapshot_lock:
+                                _tier_thresholds[(provider, effective_model)] = _snap.get(
+                                    "tier_threshold_tokens"
+                                )
                     except Exception as _snap_exc:
                         tele_log.debug("pricing snapshot capture failed: %s", _snap_exc)
+
+            long_context_override = None
+            with _pricing_snapshot_lock:
+                _tier = _tier_thresholds.get((provider, effective_model))
+            if _tier is not None:
+                long_context_override = 1 if prompt_tokens > _tier else 0
+
+            db.record_llm_call(
+                session_id=session_id,
+                ts=_utcnow(),
+                model=effective_model,
+                provider=provider,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                cost_usd=cost,
+                latency_ms=latency_ms,
+                cache_read_tokens=cache_read_tok,
+                cache_write_tokens=cache_write_tok,
+                reasoning_tokens=reasoning_tok,
+                estimated=estimated,
+                provider_assumed=provider_assumed,
+                moa_preset=moa_preset,
+                kanban_board=kanban_board,
+                kanban_task=kanban_task,
+                kanban_run=kanban_run,
+                retry_count=retry_count,
+                api_request_id=api_request_id,
+                upstream_provider=upstream_provider,
+                provider_generation_id=provider_generation_id,
+                billed_cost_usd=billed_cost_usd,
+                billing_source=billing_source,
+                billing_status=billing_status,
+                long_context_override=long_context_override,
+            )
         except Exception as exc:
             tele_log.error("post_api_request hook failed: %s", exc)
 
@@ -459,6 +552,14 @@ def register(ctx) -> None:  # noqa: ANN001
         **_kw,
     ) -> None:
         try:
+            # Retry accounting (v17): every api_request_error increments the
+            # session's pending counter; the next successful post_api_request
+            # records it as llm_calls.retry_count and clears it. Kept ahead of
+            # the 404 filter so ALL observed errors count, not just model-gone.
+            if session_id:
+                with _retry_counts_lock:
+                    _retry_counts[session_id] = _retry_counts.get(session_id, 0) + 1
+
             if status_code != 404:
                 return
             # Conservative filter: 404 must be non-retryable to count as a true
