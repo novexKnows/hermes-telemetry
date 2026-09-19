@@ -1,0 +1,5 @@
+# Byte-identity pins (HTB-B1): these files are sha256-pinned copies of the
+# R-OBS-00 contract; a re-checkout must never rewrite their line endings or
+# the drift test (tests/test_envelope_schema_drift.py) goes red.
+schemas/correlation-envelope.schema.json eol=lf
+docs/telemetry/telemetry-contract.md eol=lf
