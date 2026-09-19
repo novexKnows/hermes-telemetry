@@ -12,13 +12,15 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 import seer as seer_module
 import sinks as sinks_module
 
-SENTRY_CREDENTIAL_ENV_VARS = ["SENTRY_AUTH_TOKEN", "SENTRY_ORG", "SENTRY_PROJECT"]
+SENTRY_CREDENTIAL_ENV_VARS = ["SENTRY_DSN", "SENTRY_AUTH_TOKEN", "SENTRY_ORG", "SENTRY_PROJECT"]
 
 MARKERS = [
     "SENTINEL-PROMPT-TEXT",
@@ -126,6 +128,31 @@ def test_seer_summarize_issue_post_shape():
     assert result["body"]["scores"]["possibleCauseConfidence"] == 0.4
 
 
+def test_seer_summarize_issue_forced_event_post_shape():
+    """event_id maps to the endpoint's force_event_id (verified against live
+    getsentry source) so the summary provably belongs to THAT event."""
+    transport = RecordingTransport(
+        responses={
+            (
+                "POST",
+                "https://sentry.io/api/0/organizations/sovav/issues/42/summarize/",
+            ): (200, {"groupId": "42", "eventId": "e" * 32, "headline": "H"})
+        }
+    )
+    client = make_client(transport)
+    result = client.summarize_issue("42", event_id="e" * 32)
+    assert result["ok"] is True
+    url, method, headers, body = transport.calls[0]
+    assert url.endswith("/organizations/sovav/issues/42/summarize/")
+    assert method == "POST"
+    assert json.loads(body) == {"event_id": "e" * 32}
+    # Without event_id the body stays the empty-object default.
+    transport2 = RecordingTransport()
+    make_client(transport2).summarize_issue("42")
+    _url, _method, _h, body2 = transport2.calls[0]
+    assert json.loads(body2) == {}
+
+
 def test_seer_trigger_autofix_surfaces_409_verbatim():
     transport = RecordingTransport(
         responses={
@@ -176,85 +203,167 @@ def test_seer_transport_failure_normalized_not_raised():
 # Integration — live Seer leg (skip without credentials; NEVER fabricated)
 # ---------------------------------------------------------------------------
 
+SENTRY_API = "https://sentry.io/api/0"
+SENTRY_READBACK_DEADLINE_S = 120.0
+SENTRY_READBACK_POLL_S = 10.0
+
+
+def _sentry_event_id_for(event_id: str) -> str:
+    """The Sentry event id the exporter assigned for a transport event id."""
+    return sinks_module.langsmith_run_id_for_event(event_id).replace("-", "")
+
+
+def _sentry_api_get(path: str, token: str) -> tuple[int, object]:
+    from urllib import request as urlreq
+
+    req = urlreq.Request(f"{SENTRY_API}{path}", headers={"Authorization": f"Bearer {token}"})
+    with urlreq.urlopen(req, timeout=15) as resp:
+        return int(resp.status), json.load(resp)
+
+
+def _poll_sentry_event(token: str, org: str, project: str, sentry_event_id: str) -> dict:
+    """Poll the per-event read-back until it appears (or DeadlineExceeded).
+
+    Read-back of the exact per-run id is what proves FRESH ingestion — an
+    older server object cannot answer for a fresh id (the R4b reviewer
+    reproduced the fixed-id failure mode).
+    """
+    import time
+    from urllib import error as urlerror
+
+    deadline = time.monotonic() + SENTRY_READBACK_DEADLINE_S
+    while time.monotonic() < deadline:
+        try:
+            status, body = _sentry_api_get(
+                f"/projects/{org}/{project}/events/{sentry_event_id}/", token
+            )
+        except urlerror.HTTPError as exc:
+            if exc.code == 404:  # not yet processed — keep polling
+                time.sleep(SENTRY_READBACK_POLL_S)
+                continue
+            raise
+        return body
+    raise AssertionError(
+        f"event {sentry_event_id} not readable after {SENTRY_READBACK_DEADLINE_S:.0f}s"
+    )
+
+
+# Fresh-object timestamp proof (R4b2 round-3 MAJOR finding): Sentry's API
+# ``dateCreated`` must fall inside THIS run's delivery window. Small allowance
+# for API timestamp precision / clock skew on either side.
+SENTRY_DATECREATED_SKEW_S = 5.0
+
+
+def _assert_fresh_datecreated(body: dict, delivered_after: datetime) -> datetime:
+    """Assert the read-back event's ``dateCreated`` is within the fresh window.
+
+    ``delivered_after`` is the UTC timestamp captured immediately BEFORE
+    delivery; the API creation timestamp must be >= it (minus the skew
+    allowance) and <= now (plus it). A reused older event cannot pass this.
+    """
+    raw = body.get("dateCreated")
+    assert isinstance(raw, str) and raw, f"missing/invalid dateCreated in read-back: {raw!r}"
+    created = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    lower = delivered_after - timedelta(seconds=SENTRY_DATECREATED_SKEW_S)
+    upper = datetime.now(timezone.utc) + timedelta(seconds=SENTRY_DATECREATED_SKEW_S)
+    assert lower <= created <= upper, (
+        f"dateCreated {created.isoformat()} outside fresh window "
+        f"[{lower.isoformat()}, {upper.isoformat()}] — object is not from this run"
+    )
+    return created
+
 
 def test_integration_seer_sandbox_analysis_loop(credential_env_snapshot_and_clear, monkeypatch):
-    """Real Seer loop: setup-check -> ingest metadata-only event -> find its
-    issue -> summarize -> autofix attempt (reported, not asserted to succeed).
+    """Real Seer loop: setup-check -> ingest a FRESH metadata-only event ->
+    read back THAT exact event -> join its issue group by the event's own
+    group id (never by the shared title) -> summarize -> autofix attempt
+    (reported, not asserted to succeed).
 
-    Requires SENTRY_AUTH_TOKEN in the ambient env. Skips (not fails) without
-    credentials — the no-fabrication gate.
+    Requires SENTRY_DSN + SENTRY_AUTH_TOKEN in the ambient env. Skips (not
+    fails) without credentials — the no-fabrication gate.
     """
     ambient = credential_env_snapshot_and_clear
-    if not ambient.get("SENTRY_AUTH_TOKEN"):
-        pytest.skip("no Sentry credentials in ambient env (SENTRY_AUTH_TOKEN absent)")
+    if not (ambient.get("SENTRY_AUTH_TOKEN") and ambient.get("SENTRY_DSN")):
+        pytest.skip("no Sentry credentials in ambient env (SENTRY_DSN / SENTRY_AUTH_TOKEN absent)")
     for name, value in ambient.items():
         monkeypatch.setenv(name, value)
-
-    from urllib import request as urlreq
 
     token = os.environ["SENTRY_AUTH_TOKEN"]
     org = os.environ.get("SENTRY_ORG") or seer_module.SeerClient.DEFAULT_ORG
     project = os.environ.get("SENTRY_PROJECT") or seer_module.SeerClient.DEFAULT_PROJECT
-    api = "https://sentry.io/api/0"
 
     client = seer_module.SeerClient()  # reads env itself
     check = client.setup_check()
     assert check["ok"] is True, check
     assert "setupAcknowledgement" in check["body"]
 
-    # Seer requires an existing issue; drive one from a fresh metadata-only
-    # event delivered through the verified ingestion path, then find its group.
+    # Seer requires an existing issue; drive one from a FRESH metadata-only
+    # event. Per-run unique ids + a non-null handoff_id make the envelope
+    # schema-valid AND make every join below provably THIS run's ingestion.
+    run_hex = uuid.uuid4().hex
     envelope = {
         "board": "sovav-hermes",
-        "task_id": "t_e3985496",
-        "run_id": 22,
+        "task_id": "t_e246539f",
+        "run_id": 28,
         "parent_task_ids": [],
         "profile/role": "worker",
         "model": "z-ai/glm-5.3-flash",
         "provider": "openrouter",
         "key_id": "unlabeled",
         "call_class": "aux",
-        "handoff_id": None,
+        "handoff_id": f"hnd-{run_hex[12:24]}",
         "worktree/branch": "wt/htb-b4b",
-        "trace_id": "trc_htb4b_seer_0001",
+        "trace_id": f"trc-{run_hex[24:36]}",
         "repo": None,
     }
     event = {
-        "event_id": "ev-9201",
-        "enqueued_at": "2026-09-19T16:30:00.000000+00:00",
+        "event_id": f"ev-{run_hex[:12]}",
+        "enqueued_at": datetime.now(timezone.utc).isoformat(),
         "attempt": 1,
         "envelope": envelope,
     }
     exporter = sinks_module.SentryExporter()  # reads SENTRY_DSN from env
     assert exporter.configured, "SENTRY_DSN not set in ambient env"
+    delivered_after = datetime.now(timezone.utc)  # fresh-object lower bound, pre-delivery
     delivered = exporter.deliver([event])
     assert delivered["ok"] is True, delivered["detail"]
 
-    req = urlreq.Request(
-        f"{api}/projects/{org}/{project}/issues/?query=&per_page=10",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    with urlreq.urlopen(req, timeout=15) as resp:
-        issues = json.load(resp)
-    our_issue = next(
-        (i for i in issues if i.get("title") == sinks_module.SentryExporter.RUN_MESSAGE), None
-    )
-    assert our_issue is not None, "telemetry issue group not found in project"
+    # Prove fresh ingestion of THIS run's event (polls past async ingest
+    # latency), and join Seer to the issue group the fresh event itself
+    # landed in — not by title, which is shared across ALL telemetry events.
+    sentry_event_id = _sentry_event_id_for(event["event_id"])
+    event_body = _poll_sentry_event(token, org, project, sentry_event_id)
+    assert event_body["eventID"] == sentry_event_id
+    # API creation timestamp inside THIS run's delivery window (freshness).
+    _assert_fresh_datecreated(event_body, delivered_after)
+    tags = {t["key"]: t["value"] for t in event_body["tags"]}
+    assert tags["event_id"] == event["event_id"]
+    assert tags["trace_id"] == envelope["trace_id"]
+    assert tags["handoff_id"] == envelope["handoff_id"]
+    group_id = event_body["groupID"]
 
-    analysis = client.summarize_issue(our_issue["id"])
+    analysis = client.summarize_issue(group_id, event_id=sentry_event_id)
     assert analysis["ok"] is True, analysis
     body = analysis["body"]
     for key in ("headline", "whatsWrong", "possibleCause"):
         assert key in body
-    # §3.3 negative scan over the round-tripped analysis.
-    serialized = json.dumps(body)
-    for marker in MARKERS:
-        assert marker not in serialized
+    # The returned analysis must reference the FRESH event id — an analysis
+    # of an older sibling event does not prove this run's loop. The forced
+    # event is pinned via the endpoint's force_event_id (verified against
+    # live getsentry source), so the response's eventId must be ours.
+    serialized_analysis = json.dumps(body)
+    assert sentry_event_id in serialized_analysis, serialized_analysis
 
-    autofix = client.trigger_autofix(our_issue["id"])
+    # §3.3 negative scan over the round-tripped analysis.
+    for marker in MARKERS:
+        assert marker not in serialized_analysis
+
+    autofix = client.trigger_autofix(group_id)
     # Either the run starts (repos connected) or Sentry refuses with a coded
     # reason (sandbox: repos_not_linked). Both are real API outcomes; only a
     # transport-level failure would be a defect.
     assert autofix["status"] is not None
-    status = client.autofix_status(our_issue["id"])
+    status = client.autofix_status(group_id)
     assert status["ok"] is True

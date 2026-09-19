@@ -126,14 +126,26 @@ class SeerClient:
         p = project or self.project
         return self._call(f"/projects/{self.org}/{p}/seer/preferences/")
 
-    def summarize_issue(self, issue_id: str | int) -> dict:
+    def summarize_issue(self, issue_id: str | int, event_id: str | None = None) -> dict:
         """``POST /organizations/{org}/issues/{issue_id}/summarize/``.
 
         The verified usable Seer analysis loop: Sentry sends the issue's
         metadata to Seer and returns ``headline``/``whatsWrong``/
         ``possibleCause``/``scores``.
+
+        ``event_id`` (a Sentry event id, hex) maps to the endpoint's
+        ``force_event_id`` (getsentry/sentry ``src/sentry/seer/endpoints/
+        group_ai_summary.py`` — verified against live source): the summary is
+        generated for THAT specific event, and the response's ``eventId``
+        names it. Without it Seer picks the event itself, which can be an
+        older sibling of the group rather than the event being proven.
         """
-        return self._call(f"/organizations/{self.org}/issues/{issue_id}/summarize/", method="POST")
+        payload = {"event_id": event_id} if event_id else None
+        return self._call(
+            f"/organizations/{self.org}/issues/{issue_id}/summarize/",
+            method="POST",
+            payload=payload,
+        )
 
     def trigger_autofix(self, issue_id: str | int) -> dict:
         """``POST /organizations/{org}/issues/{issue_id}/autofix/``.
