@@ -666,3 +666,123 @@ def test_budget_path_unaffected_by_emission(ctx):
     # without perturbing the budget verdict (None returned, no block dict).
     assert len(envelope.recent_records()) == 3
     assert db.get_run("s") is not None
+
+
+# ---------------------------------------------------------------------------
+# Unicode default-ignorable obfuscation (HTB-B1-FIX). A U+200B inserted
+# after "sk-" previously defeated the value scrubber and let the exact
+# secret value ride on allowlisted envelope.model and event.model. These
+# tests reproduce the reviewer probe class across envelope AND event
+# allowlisted fields (U+200B + at least one other default-ignorable
+# variant), plus a nested unknown-kwarg case, deep-scanning every emission
+# (json.dumps + repr) the way the negative tests above do.
+# ---------------------------------------------------------------------------
+
+OBF_SECRET_BODY = "FAKEKEY0123456789abcdef"
+OBF_SEPARATORS = (
+    "\u200b",  # ZERO WIDTH SPACE (Cf) — the reviewer probe variant
+    "\u2060",  # WORD JOINER (Cf)
+    "\u00ad",  # SOFT HYPHEN (Cf)
+    "\ufeff",  # ZERO WIDTH NO-BREAK SPACE / BOM (Cf)
+)
+
+
+def _assert_no_obfuscation(scan_text: str):
+    for sep in OBF_SEPARATORS:
+        assert sep not in scan_text, f"default-ignorable U+{ord(sep):04X} survived emission"
+
+
+def test_neg_session_start_zwsp_obfuscated_model_scrubbed_envelope_and_event(ctx):
+    """U+200B after the sk- prefix must not let the secret reach the
+    allowlisted envelope.model or event.model fields."""
+    ctx.fire(
+        "on_session_start",
+        session_id="sess_a",
+        model=f"sk-\u200b{OBF_SECRET_BODY}",
+        platform="cli",
+    )
+    scan = _deep_scan()
+    _assert_no_banned(scan)
+    _assert_no_obfuscation(scan)
+    assert OBF_SECRET_BODY not in scan
+    record = envelope.recent_records()[-1]
+    assert record["envelope"]["model"] == redaction.REDACTED
+    assert record["event"]["model"] == redaction.REDACTED
+
+
+def test_neg_post_llm_call_soft_hyphen_obfuscated_model_scrubbed(ctx):
+    """Second default-ignorable variant (U+00AD) through a different capture
+    point, hitting both the envelope and the event allowlisted model field."""
+    ctx.fire(
+        "post_llm_call",
+        session_id="sess_a",
+        model=f"sk-\u00ad{OBF_SECRET_BODY}",
+        platform="cli",
+    )
+    scan = _deep_scan()
+    _assert_no_banned(scan)
+    _assert_no_obfuscation(scan)
+    assert OBF_SECRET_BODY not in scan
+    record = envelope.recent_records()[-1]
+    assert record["envelope"]["model"] == redaction.REDACTED
+    assert record["event"]["model"] == redaction.REDACTED
+
+
+def test_neg_post_tool_call_word_joiner_obfuscated_tool_name_scrubbed(ctx):
+    """Obfuscated secret-shape riding an event allowlisted field other than
+    model (tool_name) is scrubbed too."""
+    ctx.fire(
+        "post_tool_call",
+        tool_name=f"sk-\u2060{OBF_SECRET_BODY}",
+        result="ok",
+        duration_ms=1,
+        session_id="sess_a",
+    )
+    scan = _deep_scan()
+    _assert_no_banned(scan)
+    _assert_no_obfuscation(scan)
+    assert OBF_SECRET_BODY not in scan
+    record = envelope.recent_records()[-1]
+    assert record["event"]["tool_name"] == redaction.REDACTED
+
+
+def test_neg_post_api_request_bom_obfuscated_provider_scrubbed(ctx):
+    """Envelope.provider (allowlisted) with a U+FEFF obfuscation variant —
+    an obfuscated SECRET SHAPE riding the provider field is scrubbed."""
+    ctx.fire(
+        "post_api_request",
+        session_id="sess_a",
+        model="m1",
+        provider=f"\ufeffsk-\ufeff{OBF_SECRET_BODY}",
+        api_duration=0.1,
+        usage={"input_tokens": 1, "output_tokens": 1},
+        api_call_count=0,
+    )
+    scan = _deep_scan()
+    _assert_no_banned(scan)
+    _assert_no_obfuscation(scan)
+    assert OBF_SECRET_BODY not in scan
+    record = envelope.recent_records()[-1]
+    assert record["envelope"]["provider"] == redaction.REDACTED
+    assert record["event"]["provider"] == redaction.REDACTED
+
+
+def test_neg_nested_unknown_kwarg_obfuscated_secret_dropped(ctx):
+    """A secret-shaped value hidden in a NESTED unknown kwarg is dropped by
+    the allowlist regardless of obfuscation — and even in the dropped case
+    nothing ignorable or secret-shaped can appear in any emission."""
+    ctx.fire(
+        "on_session_finalize",
+        session_id="sess_a",
+        platform="cli",
+        api_kwargs={
+            "model": f"sk-\u200b{OBF_SECRET_BODY}",
+            "prompt": f"{PROMPT_MARKER} \u2060{OBF_SECRET_BODY}",
+        },
+    )
+    scan = _deep_scan()
+    _assert_no_banned(scan)
+    _assert_no_obfuscation(scan)
+    assert OBF_SECRET_BODY not in scan
+    for record in envelope.recent_records():
+        assert "api_kwargs" not in record["event"]

@@ -11,11 +11,15 @@ Two layers, both fail-closed:
    ``ALLOWED_EVENT_KEYS``. Anything else (prompt text, tool results, tool
    args, error message prose, file contents, secrets) is DROPPED, never
    logged, never echoed. Dropped keys are counted, not named.
-2. **Value-level secret scrubbing** — defense in depth. Any string that
-   matches a known secret SHAPE (API key prefixes, bearer tokens, DSNs,
-   private-key blocks, credentialed URLs) is replaced with a fixed sentinel
-   before it can ride on an allowlisted metadata field (e.g. a model id or
-   provider string copied from an adversarial hook payload).
+2. **Value-level secret scrubbing** — defense in depth. Unicode
+   default-ignorable characters (zero-width separators, bidirectional
+   controls, variation selectors — the Cf/Zl/Zp classes and known outliers)
+   are stripped FIRST and the emitted value is the stripped form; any
+   resulting string that matches a known secret SHAPE (API key prefixes,
+   bearer tokens, DSNs, private-key blocks, credentialed URLs) is replaced
+   with a fixed sentinel before it can ride on an allowlisted metadata field
+   (e.g. a model id or provider string copied from an adversarial hook
+   payload).
 
 The sanitizer never raises and never logs payload content. It is applied at
 emission time inside envelope.emit() — BEFORE the in-memory buffer or any
@@ -26,6 +30,7 @@ from __future__ import annotations
 
 import re
 import threading
+import unicodedata
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -93,6 +98,46 @@ ALLOWED_EVENT_KEYS: frozenset[str] = frozenset(
 REDACTED = "[REDACTED]"
 
 # ---------------------------------------------------------------------------
+# Unicode default-ignorable normalization. Default-ignorable code points
+# (Unicode DerivedCoreProperties) are invisible in display but ARE part of
+# the string value, so an attacker can interleave them into a secret to
+# defeat shape matching (e.g. U+200B ZERO WIDTH SPACE inserted after "sk-").
+# They are stripped BEFORE the secret patterns below run, and the emitted
+# value is the normalized (stripped) form, so nothing ignorable survives.
+# Cover: the Cf / Zl / Zp general categories plus the default-ignorable
+# outliers whose category is Lo / Mn / Cn.
+# ---------------------------------------------------------------------------
+_DEFAULT_IGNORABLE_CATEGORIES = frozenset({"Cf", "Zl", "Zp"})
+
+_EXTRA_DEFAULT_IGNORABLE_RANGES: tuple[tuple[int, int], ...] = (
+    (0x034F, 0x034F),  # COMBINING GRAPHEME JOINER (Mn)
+    (0x115F, 0x1160),  # HANGUL JUNGSEONG/JONGSEONG FILLER (Lo)
+    (0x17B4, 0x17B5),  # KHMER VOWEL INHERENT AQ/AA (Mn)
+    (0x180B, 0x180D),  # MONGOLIAN FREE VARIATION SELECTOR ONE-THREE (Mn)
+    (0xFE00, 0xFE0F),  # VARIATION SELECTOR-1..16 (Mn)
+    (0x2065, 0x2065),  # unassigned, default-ignorable (Cn)
+    (0x3164, 0x3164),  # HANGUL FILLER (Lo)
+    (0xFFA0, 0xFFA0),  # HALFWIDTH HANGUL FILLER (Lo)
+    (0xFFF0, 0xFFF8),  # unassigned, default-ignorable (Cn)
+    (0xE0000, 0xE0FFF),  # tag characters / variation selectors supplement (Cn)
+)
+
+
+def _is_default_ignorable(ch: str) -> bool:
+    if unicodedata.category(ch) in _DEFAULT_IGNORABLE_CATEGORIES:
+        return True
+    cp = ord(ch)
+    return any(lo <= cp <= hi for lo, hi in _EXTRA_DEFAULT_IGNORABLE_RANGES)
+
+
+def strip_default_ignorables(value: str) -> str:
+    """Remove every Unicode default-ignorable character from ``value``."""
+    if not value:
+        return value
+    return "".join(ch for ch in value if not _is_default_ignorable(ch))
+
+
+# ---------------------------------------------------------------------------
 # Secret-shape patterns (value scrubbing). Ordered; each match is replaced
 # with REDACTED. Deliberately conservative shapes — must not false-positive
 # on ordinary model ids (e.g. "gpt-4o", "z-ai/glm-5.3-flash") or provider
@@ -145,7 +190,10 @@ def reset_stats() -> None:
 
 
 def _scrub_string(value: str) -> str:
-    out = value
+    # Normalize BEFORE matching: default-ignorable separators are invisible
+    # but would split a secret shape so the patterns below never match. The
+    # emitted value is the normalized form — scrub applies to it directly.
+    out = strip_default_ignorables(value)
     hits = 0
     for pattern in _SECRET_PATTERNS:
         out, n = pattern.subn(REDACTED, out)

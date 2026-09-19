@@ -102,3 +102,75 @@ def test_scrub_hits_counter_counts_and_resets():
     assert redaction.scrub_hits() >= 2
     redaction.reset_stats()
     assert redaction.scrub_hits() == 0
+
+
+# ---------------------------------------------------------------------------
+# Unicode default-ignorable obfuscation (reviewer-adversarial class):
+# a U+200B inserted after "sk-" previously defeated shape matching and let
+# the exact secret value ride on allowlisted fields.
+# ---------------------------------------------------------------------------
+
+_SECRET_BODY = "FAKEKEY0123456789abcdef"
+
+# One representative per default-ignorable class: Cf zero-width / bidi
+# controls, Cf variation selectors, Zl / Zp separators, and the known
+# default-ignorable outliers (Mn / Lo / Cn).
+DEFAULT_IGNORABLE_SEPARATORS = {
+    "zero-width-space-U+200B": "\u200b",
+    "zero-width-non-joiner-U+200C": "\u200c",
+    "zero-width-joiner-U+200D": "\u200d",
+    "rtl-mark-U+200F": "\u200f",
+    "word-joiner-U+2060": "\u2060",
+    "bidi-isolate-init-U+2066": "\u2066",
+    "soft-hyphen-U+00AD": "\u00ad",
+    "bom-U+FEFF": "\ufeff",
+    "variation-selector-16-U+FE0F": "\ufe0f",
+    "variation-selector-1-U+FE00": "\ufe00",
+    "line-separator-U+2028": "\u2028",
+    "paragraph-separator-U+2029": "\u2029",
+    "bidi-embed-U+202B": "\u202b",
+    "combining-grapheme-joiner-U+034F": "\u034f",
+    "khmer-inherent-vowel-U+17B4": "\u17b4",
+    "mongolian-fvs-1-U+180B": "\u180b",
+    "hangul-filler-U+3164": "\u3164",
+    "tag-char-U+E0001": "\U000e0001",
+}
+
+
+def test_default_ignorable_obfuscated_sk_secrets_still_scrubbed():
+    for label, sep in DEFAULT_IGNORABLE_SEPARATORS.items():
+        out = redaction.sanitize({"model": f"sk-{sep}{_SECRET_BODY}"})["model"]
+        assert "[REDACTED]" in out, f"secret leaked through separator {label}: {out!r}"
+        assert _SECRET_BODY not in out, f"secret body leaked via {label}"
+        assert sep not in out, f"default-ignorable {label} survived emission"
+
+
+def test_default_ignorable_interleaved_inside_secret_body_still_scrubbed():
+    # Separators interleaved mid-body, not just after the prefix.
+    obfuscated = "sk-FAKE\u200bKEY012345\u20606789abcdef\u00ad"
+    out = redaction.sanitize({"model": obfuscated})["model"]
+    assert "[REDACTED]" in out and _SECRET_BODY not in out
+
+
+def test_default_ignorable_obfuscated_other_secret_families_scrubbed():
+    cases = {
+        "ghp": f"ghp_\u2060{'a' * 30}",
+        "bearer": f"Bearer\u200b {'a' * 24}",
+        "aws": "AKIA\u200bA1B2C3D4E5F6G7H8I9J0",
+    }
+    for family, text in cases.items():
+        out = redaction.sanitize({"model": text})["model"]
+        assert "[REDACTED]" in out, f"{family} leaked through default-ignorable: {out!r}"
+
+
+def test_default_ignorables_stripped_from_benign_values_emitted_normalized():
+    # The emitted value is the NORMALIZED (stripped) form — nothing ignorable
+    # can survive on any emitted string, secret-shaped or not.
+    assert redaction.sanitize({"model": "glm\u200b-5.3"})["model"] == "glm-5.3"
+    assert redaction.sanitize({"session_id": "s\u20601"})["session_id"] == "s1"
+
+
+def test_non_ignorable_rare_letters_are_not_stripped():
+    # Guard against over-stripping: an ordinary (non-default-ignorable)
+    # letter — Soyombo Letter SHA, category Lo — must survive unchanged.
+    assert redaction.sanitize({"model": "sk-𑩿fake"})["model"] == "sk-𑩿fake"
