@@ -14,7 +14,13 @@ Boundaries (module ownership, TM card t_77d64af1):
 Every kwarg name consumed below was verified against the INSTALLED v0.21.3
 Hermes source (C:/Users/Sovav/AppData/Local/hermes/hermes-agent, commit
 0ddba07ad7, version 0.21.3) — see the mapping doc for file:line evidence.
-Unknown kwargs are simply ignored; callers pass ``**hook_kwargs`` dicts freely.
+EVIDENCE BASIS: the installed tree is dirty — response ``id``/``provider``/
+``billed_cost_usd`` (agent/api_request_hooks.py:148-163) and a projection-body
+merge in agent/auxiliary_client.py are UNCOMMITTED changes absent from commit
+0ddba07ad7. Those fields are evidenced against the dirty installed tree, NOT
+the commit (see docs/telemetry/utilization-metrics-mapping.md § Source
+provenance). Unknown kwargs are simply ignored; callers pass ``**hook_kwargs``
+dicts freely.
 
 Controller metrics the v0.21.3 hooks CANNOT source are listed in ``GAPS``
 (never invented here; each gap names the evidence and the hook/feature that
@@ -40,7 +46,10 @@ __all__ = [
     "envelope_attribution_from_kanban_blocked",
     "envelope_attribution_from_kanban_claimed",
     "envelope_attribution_from_kanban_completed",
+    "event_metadata_from_kanban_lifecycle",
     "session_outcome_from_on_session_end",
+    "interrupt_metrics_from_agent_loop_stopped",
+    "moa_metrics_from_moa_references",
     "tool_call_metrics_from_post_tool_call",
     "usage_metrics_from_post_api_request",
     "CALL_CLASS_VALUES",
@@ -65,13 +74,16 @@ GAPS: List[Dict[str, str]] = [
     {
         "metric": "envelope.key_id",
         "reason": (
-            "No hook kwarg carries a non-secret credential label. Request/response hook "
-            "payloads sanitize credential values to '<redacted>' "
-            "(agent/api_request_hooks.py:60-64,95) but expose no key NAME or hash prefix."
+            "No hook kwarg carries a non-secret credential label, so credential rotation "
+            "and failover cannot be attributed to a key. Request/response hook payloads "
+            "sanitize credential values to '<redacted>' "
+            "(agent/api_request_hooks.py:60-64,95) but expose no key NAME or hash prefix "
+            "and no rotation/failover decision."
         ),
         "needed_hook": (
-            "post_api_request / pre_api_request kwarg key_id (label only), sourced from the "
-            "gateway's credential-rotation layer"
+            "post_api_request / pre_api_request kwarg key_id (label only) plus a "
+            "rotation/failover decision label, sourced from the gateway's "
+            "credential-rotation layer"
         ),
     },
     {
@@ -84,10 +96,24 @@ GAPS: List[Dict[str, str]] = [
         "needed_hook": "kanban_task_claimed kwarg parent_task_ids: list[str]",
     },
     {
+        "metric": "failed_attempt.tokens/cost",
+        "reason": (
+            "Failed/billed-attempt accounting is missing: api_request_error fires error "
+            "metadata only (status/retry context, agent/api_request_hooks.py:175-210) with "
+            "no usage or billed cost, and _usage_summary_for_api_request_hook + "
+            "_api_response_payload_for_hook cover successful responses only "
+            "(agent/api_request_hooks.py:35-49,142-173). A failed attempt therefore has no "
+            "token or cost payload at all."
+        ),
+        "needed_hook": (
+            "api_request_error kwarg usage + billed_cost_usd (partial-attempt accounting)"
+        ),
+    },
+    {
         "metric": "envelope.trace_id",
         "reason": (
             "No hook carries a cross-repo trace identifier. pre_api_request.middleware_trace "
-            "(agent/turn_api_request.py:79) is the LLM request-middleware trace, not a trace id."
+            "(agent/turn_api_request.py:85) is the LLM request-middleware trace, not a trace id."
         ),
         "needed_hook": "post_api_request kwarg trace_id (or a documented LangSmith run-id bridge)",
     },
@@ -113,11 +139,16 @@ GAPS: List[Dict[str, str]] = [
     {
         "metric": "envelope.call_class = 'fallback'",
         "reason": (
-            "Fallback routing is not exposed as a class. post_api_request.response.provider "
-            "(agent/api_request_hooks.py:148-163) reveals the upstream that actually served the "
-            "request, but nothing marks the call as a fallback path."
+            "Fallback routing and failover decisions (provider failover, credential "
+            "rotation) are not exposed as a class or as a decision id. "
+            "post_api_request.response.provider (agent/api_request_hooks.py:148-163, dirty "
+            "installed tree) reveals the upstream that actually served the request, but "
+            "nothing marks the call as a fallback path or names the rotation/failover decision."
         ),
-        "needed_hook": "post_api_request kwarg call_class or failover_reason",
+        "needed_hook": (
+            "post_api_request kwarg call_class or failover_reason "
+            "(including credential-rotation/failover decision attribution)"
+        ),
     },
     {
         "metric": "envelope.call_class = 'aux'",
@@ -125,7 +156,7 @@ GAPS: List[Dict[str, str]] = [
             "Auxiliary-path calls (MoA reference models, one-shot /moa) run through "
             "agent/auxiliary_client.py::call_llm, which contains no invoke_hook dispatch — no "
             "hook fires, so no kwarg exists to classify. post_api_request.moa_references "
-            "(agent/turn_response_intake.py:88; agent/conversation_loop.py:270-280) exposes the "
+            "(agent/turn_response_intake.py:92; agent/conversation_loop.py:270-280) exposes the "
             "AGGREGATOR-generation per-advisor metrics only."
         ),
         "needed_hook": "hook dispatch inside agent/auxiliary_client.py::call_llm",
@@ -172,7 +203,7 @@ GAPS: List[Dict[str, str]] = [
         "reason": (
             "post_api_request.usage is None when the provider returns no usage info "
             "(agent/api_request_hooks.py:35-41); only approx_input_tokens from pre_api_request "
-            "(agent/turn_api_request.py:80) supports an estimate, and estimation is the "
+            "(agent/turn_api_request.py:81) supports an estimate, and estimation is the "
             "caller's policy, not extraction."
         ),
         "needed_hook": "provider-side guaranteed usage reporting (upstream, not a plugin hook)",
@@ -211,30 +242,62 @@ def _put(out: Dict[str, Any], key: str, value: Any) -> None:
 # (hermes_cli/kanban_db.py:151-172, 2288, 2803, 3172-3174 — common kwargs
 # task_id, board, assignee, run_id, profile_name; completed adds summary,
 # blocked adds reason.)
+#
+# OUTPUT CONTRACT: envelope-attribution output keys are a strict SUBSET of the
+# pinned correlation-envelope schema properties (v1.0.0,
+# additionalProperties: false). Non-schema hook kwargs — assignee, summary,
+# reason — are EVENT payload metadata, never envelope attribution; they are
+# extracted separately by event_metadata_from_kanban_lifecycle and joined by
+# task_id + run_id. Asserted by tests (attribution keys ⊆ schema properties).
 # ---------------------------------------------------------------------------
 
 
 def envelope_attribution_from_kanban_claimed(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """kanban_task_claimed kwargs → envelope base fields sourceable at claim time."""
+    """kanban_task_claimed kwargs → envelope base fields sourceable at claim time.
+
+    Emits ONLY correlation-envelope schema properties (board, task_id, run_id,
+    profile/role). ``assignee`` is not a schema property — it is event payload
+    metadata (event_metadata_from_kanban_lifecycle).
+    """
     out: Dict[str, Any] = {}
     _put(out, "board", kwargs.get("board"))
     _put(out, "task_id", kwargs.get("task_id"))
     _put(out, "run_id", _int(kwargs.get("run_id")))
     _put(out, "profile/role", kwargs.get("profile_name"))
-    _put(out, "assignee", kwargs.get("assignee"))
     return out
 
 
 def envelope_attribution_from_kanban_completed(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """kanban_task_completed kwargs → envelope base fields + handoff summary text."""
-    out = envelope_attribution_from_kanban_claimed(kwargs)
-    _put(out, "summary", kwargs.get("summary"))
-    return out
+    """kanban_task_completed kwargs → envelope-attributable fields at completion.
+
+    Today identical to claim time: ``summary`` is free text, not an envelope
+    schema property — it stays on the event payload
+    (event_metadata_from_kanban_lifecycle) until the schema grows a
+    ``handoff_id``/summary carrier (see GAPS: envelope.handoff_id).
+    """
+    return envelope_attribution_from_kanban_claimed(kwargs)
 
 
 def envelope_attribution_from_kanban_blocked(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """kanban_task_blocked kwargs → envelope base fields + block reason/kind."""
-    out = envelope_attribution_from_kanban_claimed(kwargs)
+    """kanban_task_blocked kwargs → envelope-attributable fields at block time.
+
+    ``reason`` is not an envelope schema property — event payload metadata
+    (event_metadata_from_kanban_lifecycle), never envelope attribution.
+    """
+    return envelope_attribution_from_kanban_claimed(kwargs)
+
+
+def event_metadata_from_kanban_lifecycle(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Kanban lifecycle EVENT payload metadata that is NOT envelope-shaped.
+
+    ``assignee`` (claimed/completed/blocked), ``summary`` (completed) and
+    ``reason`` (blocked) are not correlation-envelope schema properties
+    (additionalProperties: false). They ride on the controller event payload,
+    joined by envelope task_id + run_id — never merged into the envelope.
+    """
+    out: Dict[str, Any] = {}
+    _put(out, "assignee", kwargs.get("assignee"))
+    _put(out, "summary", kwargs.get("summary"))
     _put(out, "reason", kwargs.get("reason"))
     return out
 
@@ -291,11 +354,15 @@ def call_context_from_pre_llm_call(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """pre_llm_call kwargs (agent/turn_context.py:693-706) → call-context metrics.
 
     Carries NO token data (fires before the API call loop) — only identity.
+    Hook ``task_id`` is a per-turn UUID (``effective_task_id = task_id or
+    str(uuid.uuid4())``, agent/turn_context.py:489) — NOT the kanban card id.
+    It is exposed as ``hook_task_id`` so it can never collide with the canonical
+    envelope ``task_id`` (the board card id).
     """
     out: Dict[str, Any] = {}
     _put(out, "model", kwargs.get("model"))
     _put(out, "platform", kwargs.get("platform"))
-    _put(out, "task_id", kwargs.get("task_id"))
+    _put(out, "hook_task_id", kwargs.get("task_id"))
     _put(out, "turn_id", kwargs.get("turn_id"))
     _put(out, "sender_id", kwargs.get("sender_id"))
     _put(out, "parent_session_id", kwargs.get("parent_session_id"))
@@ -310,12 +377,16 @@ def call_context_from_pre_llm_call(kwargs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def call_context_from_post_api_request(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """post_api_request kwargs (agent/turn_response_intake.py:62-91) → call identity."""
+    """post_api_request kwargs (agent/turn_response_intake.py:62-93) → call identity.
+
+    Hook ``task_id`` is the per-turn UUID (agent/turn_context.py:489) — exposed
+    as ``hook_task_id``, never under canonical ``task_id``.
+    """
     out: Dict[str, Any] = {}
     _put(out, "model", kwargs.get("model"))
     _put(out, "provider", kwargs.get("provider"))
     _put(out, "platform", kwargs.get("platform"))
-    _put(out, "task_id", kwargs.get("task_id"))
+    _put(out, "hook_task_id", kwargs.get("task_id"))
     _put(out, "turn_id", kwargs.get("turn_id"))
     _put(out, "api_request_id", kwargs.get("api_request_id"))
     _put(out, "api_call_count", _int(kwargs.get("api_call_count")))
@@ -373,11 +444,19 @@ def usage_metrics_from_post_api_request(kwargs: Dict[str, Any]) -> Dict[str, Any
 def billing_metrics_from_post_api_request(kwargs: Dict[str, Any]) -> Dict[str, Any]:
     """post_api_request.response payload → provider-reported billing metrics.
 
-    ``response`` shape verified at agent/api_request_hooks.py:142-173:
-    ``id`` (provider generation id), ``provider`` (the upstream that actually
-    served the request, e.g. OpenRouter's routing field), ``billed_cost_usd``
+    ``response`` shape verified at agent/api_request_hooks.py:142-173 (DIRTY
+    installed tree — the ``id``/``provider``/``billed_cost_usd`` keys are
+    uncommitted changes absent from commit 0ddba07ad7): ``id`` (provider
+    generation id), ``provider`` (the upstream that actually served the
+    request, e.g. OpenRouter's routing field), ``billed_cost_usd``
     (provider-reported billed cost, present only when the provider reports
     one — OpenRouter does), ``model``, ``finish_reason``.
+
+    ``moa_references`` is NOT passed through raw: each real item carries the
+    advisor's answer text in ``output`` (agent/moa_trace.py:64-72,
+    agent/moa_loop.py:1216-1219), violating the metadata-only export contract
+    (telemetry-contract.md §3.1). It is reduced to the allowlisted projection
+    from moa_metrics_from_moa_references under the ``moa_advisors`` key.
     """
     out: Dict[str, Any] = {}
     response = kwargs.get("response")
@@ -385,10 +464,64 @@ def billing_metrics_from_post_api_request(kwargs: Dict[str, Any]) -> Dict[str, A
         _put(out, "billed_cost_usd", _float(response.get("billed_cost_usd")))
         _put(out, "serving_provider", response.get("provider"))
         _put(out, "provider_response_id", response.get("id"))
-    moa_references = kwargs.get("moa_references")
-    if moa_references is not None:
-        out["moa_references"] = moa_references
+    moa_metrics = moa_metrics_from_moa_references(kwargs.get("moa_references"))
+    if moa_metrics:
+        out["moa_advisors"] = moa_metrics
     return out
+
+
+# Allowlisted projection of one post_api_request.moa_references item. Real item
+# shape verified: agent/moa_trace.py slot_metrics (:64-72) over _slot_trace
+# (:52-61), built for the hook at agent/moa_loop.py:1216-1219 — label, account
+# identity (model/provider/temperature), a ``usage`` dict of token buckets,
+# and cost status/source. ``output`` (the advisor's answer text — a prompt/
+# tool-output-class body) and ``input_messages`` are explicitly DISCARDED:
+# metadata-only contract, telemetry-contract.md §3.1/§3.2.
+_MOA_ITEM_ALLOWLIST = (
+    "label",
+    "model",
+    "provider",
+    "temperature",
+    "cost_usd",
+    "cost_status",
+    "cost_source",
+)
+# Token buckets inside the item's ``usage`` dict (agent/moa_trace.py:47).
+_MOA_USAGE_KEYS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
+def moa_metrics_from_moa_references(moa_references: Any) -> Optional[List[Dict[str, Any]]]:
+    """post_api_request.moa_references → allowlisted per-advisor metric dicts.
+
+    Per item, keeps ONLY: ``label``, ``model``, ``provider``, ``temperature``,
+    ``cost_usd``, ``cost_status``, ``cost_source`` and the token buckets inside
+    ``usage``. Everything else — critically ``output`` (advisor answer text)
+    and ``input_messages`` — is dropped, never passed through. Items that are
+    not dicts are skipped; a non-list payload or ``None`` yields ``None``/empty
+    (no key is emitted by callers).
+    """
+    if moa_references is None or not isinstance(moa_references, (list, tuple)):
+        return None
+    projected: List[Dict[str, Any]] = []
+    for item in moa_references:
+        if not isinstance(item, dict):
+            continue
+        entry: Dict[str, Any] = {}
+        for key in _MOA_ITEM_ALLOWLIST:
+            _put(entry, key, item.get(key))
+        usage = item.get("usage")
+        if isinstance(usage, dict):
+            for key in _MOA_USAGE_KEYS:
+                _put(entry, key, _int(usage.get(key)))
+        if entry:
+            projected.append(entry)
+    return projected
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +534,8 @@ def tool_call_metrics_from_post_tool_call(kwargs: Dict[str, Any]) -> Dict[str, A
     out: Dict[str, Any] = {}
     _put(out, "tool_name", kwargs.get("tool_name"))
     _put(out, "tool_call_id", kwargs.get("tool_call_id"))
-    _put(out, "task_id", kwargs.get("task_id"))
+    # Per-turn UUID (agent/turn_context.py:489) — never the kanban card id.
+    _put(out, "hook_task_id", kwargs.get("task_id"))
     _put(out, "session_id", kwargs.get("session_id"))
     _put(out, "turn_id", kwargs.get("turn_id"))
     _put(out, "api_request_id", kwargs.get("api_request_id"))
@@ -413,11 +547,16 @@ def tool_call_metrics_from_post_tool_call(kwargs: Dict[str, Any]) -> Dict[str, A
 
 
 def api_error_metrics_from_api_request_error(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """api_request_error kwargs (agent/api_request_hooks.py:175-212) → error metrics."""
+    """api_request_error kwargs (agent/api_request_hooks.py:175-210) → error metrics.
+
+    No usage/billed-cost kwarg exists on this hook (failed attempts carry no
+    token/cost payload — GAPS: failed_attempt.tokens/cost).
+    """
     out: Dict[str, Any] = {}
     _put(out, "model", kwargs.get("model"))
     _put(out, "provider", kwargs.get("provider"))
-    _put(out, "task_id", kwargs.get("task_id"))
+    # Per-turn UUID (agent/turn_context.py:489) — never the kanban card id.
+    _put(out, "hook_task_id", kwargs.get("task_id"))
     _put(out, "turn_id", kwargs.get("turn_id"))
     _put(out, "api_request_id", kwargs.get("api_request_id"))
     _put(out, "status_code", _int(kwargs.get("status_code")))
@@ -436,6 +575,29 @@ def api_error_metrics_from_api_request_error(kwargs: Dict[str, Any]) -> Dict[str
         "api_duration_ms",
         int(round(api_duration_s * 1000)) if api_duration_s is not None else None,
     )
+    return out
+
+
+def interrupt_metrics_from_agent_loop_stopped(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """agent_loop_stopped kwargs → interrupt observer metrics.
+
+    Fire sites verified: gateway/run_agent_cache.py:492-498 (gateway
+    /stop and running-agent fast path; the pending-sentinel /stop path stays
+    silent) and tui_gateway/session_lifecycle.py:614-617 (TUI/desktop
+    session.interrupt). Observer-only; return value ignored. Kwarg names are
+    verbatim: session_key, platform, reason, invalidation_reason — ``reason``
+    is the interrupt reason, NOT the kanban block reason.
+
+    This is the sourceable run-interruption observer: it complements
+    session_outcome_from_on_session_end (run outcome at session end) with the
+    mid-run interrupt event; it carries session_key, not session_id, so the
+    controller joins it via platform + session key correlation.
+    """
+    out: Dict[str, Any] = {}
+    _put(out, "session_key", kwargs.get("session_key"))
+    _put(out, "platform", kwargs.get("platform"))
+    _put(out, "interrupt_reason", kwargs.get("reason"))
+    _put(out, "invalidation_reason", kwargs.get("invalidation_reason"))
     return out
 
 

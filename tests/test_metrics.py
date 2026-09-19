@@ -107,6 +107,44 @@ KANBAN_WORKER_EXITED_KWARGS = {
 
 
 # ---------------------------------------------------------------------------
+# Pinned correlation-envelope schema properties (v1.0.0, sha256 5271d5fa…33e70a,
+# C:/tmp/sovav-hermes/r-obs-00/docs/telemetry/correlation-envelope.schema.json).
+# Verbatim property list — used to assert the attribution output-key subset
+# contract (schema declares additionalProperties: false).
+# ---------------------------------------------------------------------------
+SCHEMA_PROPERTIES = frozenset(
+    {
+        "board",
+        "task_id",
+        "run_id",
+        "parent_task_ids",
+        "profile/role",
+        "model",
+        "provider",
+        "key_id",
+        "call_class",
+        "handoff_id",
+        "worktree/branch",
+        "trace_id",
+        "repo",
+        "agent_run_id",
+        "correlation_id",
+        "idempotency_key",
+        "deal_id",
+        "worker_id",
+        "model_ref",
+        "trigger_type",
+        "runtime_environment",
+        "basis_fingerprint",
+        "worker_definition_version",
+        "output_schema_version",
+        "harness_task_id",
+        "harness_run_id",
+    }
+)
+
+
+# ---------------------------------------------------------------------------
 # Envelope attribution from kanban lifecycle hooks
 # ---------------------------------------------------------------------------
 
@@ -118,26 +156,92 @@ class TestEnvelopeAttribution:
         assert out["task_id"] == "t_77d64af1"
         assert out["run_id"] == 7 and isinstance(out["run_id"], int)
         assert out["profile/role"] == "worker"  # slash is part of the canonical name
-        assert out["assignee"] == "worker"
 
-    def test_completed_adds_summary(self):
-        out = metrics.envelope_attribution_from_kanban_completed(
-            {**KANBAN_CLAIMED_KWARGS, "summary": "implemented metrics extraction"}
-        )
-        assert out["summary"] == "implemented metrics extraction"
-        assert out["task_id"] == "t_77d64af1"
+    def test_attribution_keys_are_subset_of_schema_properties(self):
+        # Schema declares additionalProperties: false — non-schema hook kwargs
+        # (assignee, summary, reason) must never ride on envelope attribution.
+        kwargs = {
+            **KANBAN_CLAIMED_KWARGS,
+            "summary": "implemented metrics extraction",
+            "reason": "needs_input: waiting on creds",
+        }
+        for fn in (
+            metrics.envelope_attribution_from_kanban_claimed,
+            metrics.envelope_attribution_from_kanban_completed,
+            metrics.envelope_attribution_from_kanban_blocked,
+        ):
+            assert set(fn(kwargs)) <= SCHEMA_PROPERTIES, fn.__name__
 
-    def test_blocked_adds_reason_and_missing_fields_are_dropped(self):
+    def test_completed_and_blocked_emit_no_non_schema_metadata(self):
+        # summary/reason/assignee live on the event payload, not the envelope.
+        for fn in (
+            metrics.envelope_attribution_from_kanban_completed,
+            metrics.envelope_attribution_from_kanban_blocked,
+        ):
+            out = fn(
+                {
+                    **KANBAN_CLAIMED_KWARGS,
+                    "summary": "implemented metrics extraction",
+                    "reason": "needs_input: waiting on creds",
+                }
+            )
+            assert "summary" not in out
+            assert "reason" not in out
+            assert "assignee" not in out
+            assert out["task_id"] == "t_77d64af1"
+
+    def test_event_metadata_separated_from_attribution(self):
+        kwargs = {
+            **KANBAN_CLAIMED_KWARGS,
+            "summary": "implemented metrics extraction",
+            "reason": "needs_input: waiting on creds",
+        }
+        out = metrics.event_metadata_from_kanban_lifecycle(kwargs)
+        assert out == {
+            "assignee": "worker",
+            "summary": "implemented metrics extraction",
+            "reason": "needs_input: waiting on creds",
+        }
+        # ...and it is exactly the set of keys attribution excludes.
+        attribution = metrics.envelope_attribution_from_kanban_completed(kwargs)
+        assert not (set(out) & set(attribution))
+
+    def test_blocked_missing_fields_are_dropped(self):
         out = metrics.envelope_attribution_from_kanban_blocked(
             {"task_id": "t_x", "run_id": None, "reason": "needs_input: waiting on creds"}
         )
-        assert out["reason"] == "needs_input: waiting on creds"
         assert "run_id" not in out  # None dropped, not coerced to 0
         assert "board" not in out
+        assert "reason" not in out
 
     def test_run_id_string_is_coerced_to_int(self):
         out = metrics.envelope_attribution_from_kanban_claimed({"task_id": "t_x", "run_id": "42"})
         assert out["run_id"] == 42
+
+
+# ---------------------------------------------------------------------------
+# task_id integrity — hook task_id is a per-turn UUID (agent/turn_context.py:489),
+# NEVER the kanban card id; it must never ride the canonical envelope key.
+# ---------------------------------------------------------------------------
+
+
+class TestTaskIdIntegrity:
+    def test_per_turn_uuid_never_populates_canonical_task_id(self):
+        per_turn_uuid = "0f2f1e5a-1111-4c33-9c33-3f9f04686ba1"
+        for fn in (
+            metrics.call_context_from_pre_llm_call,
+            metrics.call_context_from_post_api_request,
+            metrics.tool_call_metrics_from_post_tool_call,
+            metrics.api_error_metrics_from_api_request_error,
+        ):
+            out = fn({"task_id": per_turn_uuid, "turn_id": "turn_1", "model": "m"})
+            assert "task_id" not in out, fn.__name__
+            assert out.get("hook_task_id") == per_turn_uuid, fn.__name__
+
+    def test_post_api_request_fixture_uuid_lands_on_hook_task_id(self):
+        out = metrics.call_context_from_post_api_request(POST_API_REQUEST_KWARGS)
+        assert "task_id" not in out
+        assert out["hook_task_id"] == POST_API_REQUEST_KWARGS["task_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +394,85 @@ class TestBillingMetrics:
         assert metrics.billing_metrics_from_post_api_request({"response": None}) == {}
         assert metrics.billing_metrics_from_post_api_request({}) == {}
 
-    def test_moa_references_passed_through_when_present(self):
-        refs = [{"role": "advisor", "model": "m1"}]
+    def test_moa_references_projected_not_passed_through(self):
+        # REAL v0.21.3 item shape: agent/moa_trace.py slot_metrics (:64-72) over
+        # _slot_trace (:52-61), built at agent/moa_loop.py:1216-1219 with
+        # output=text — the advisor answer text rides on every real item.
+        refs = [
+            {
+                "label": "advisor-a",
+                "model": "openai/gpt-5.6-sol",
+                "provider": "openrouter",
+                "temperature": 0.7,
+                "output": "advisor answer text — never exportable (telemetry-contract §3.1)",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 40,
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "reasoning_tokens": 5,
+                },
+                "cost_usd": 0.0012,
+                "cost_status": "ok",
+                "cost_source": "provider",
+            }
+        ]
         out = metrics.billing_metrics_from_post_api_request(
             {"response": {}, "moa_references": refs}
         )
-        assert out["moa_references"] == refs
+        advisors = out["moa_advisors"]
+        assert advisors == [
+            {
+                "label": "advisor-a",
+                "model": "openai/gpt-5.6-sol",
+                "provider": "openrouter",
+                "temperature": 0.7,
+                "input_tokens": 100,
+                "output_tokens": 40,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 5,
+                "cost_usd": 0.0012,
+                "cost_status": "ok",
+                "cost_source": "provider",
+            }
+        ]
+        # no raw pass-through key, and no advisor text anywhere in the output
+        assert "moa_references" not in out
+        assert "output" not in advisors[0]
+        assert "advisor answer text" not in str(out)
+
+    def test_moa_projection_drops_anything_outside_the_allowlist(self):
+        refs = [
+            {
+                "label": "advisor-b",
+                "output": "text",
+                "input_messages": [{"role": "user", "content": "secret prompt body"}],
+                "some_future_field": "x",
+                "usage": {"input_tokens": 1, "request_count": 2},
+            }
+        ]
+        advisors = metrics.moa_metrics_from_moa_references(refs)
+        assert advisors == [{"label": "advisor-b", "input_tokens": 1}]
+        assert "request_count" not in advisors[0]  # not a moa usage bucket
+
+    def test_moa_projection_none_and_malformed(self):
+        assert metrics.moa_metrics_from_moa_references(None) is None
+        assert metrics.moa_metrics_from_moa_references("nope") is None
+        assert metrics.moa_metrics_from_moa_references([None, "junk", {"label": "ok"}]) == [
+            {"label": "ok"}
+        ]
+
+    def test_billing_moa_empty_or_absent_emits_no_key(self):
+        assert metrics.billing_metrics_from_post_api_request({"response": {}}) == {}
+        assert (
+            metrics.billing_metrics_from_post_api_request({"response": {}, "moa_references": []})
+            == {}
+        )
+        assert (
+            metrics.billing_metrics_from_post_api_request({"response": {}, "moa_references": None})
+            == {}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -460,7 +637,7 @@ class TestDispatchMetrics:
 
 class TestGaps:
     def test_gap_entries_are_well_formed(self):
-        assert len(metrics.GAPS) == 12
+        assert len(metrics.GAPS) == 13
         for gap in metrics.GAPS:
             assert set(gap) == {"metric", "reason", "needed_hook"}
             assert gap["reason"] and gap["needed_hook"]
@@ -470,6 +647,7 @@ class TestGaps:
         [
             "envelope.key_id",
             "envelope.parent_task_ids",
+            "failed_attempt.tokens/cost",
             "envelope.trace_id",
             "envelope.handoff_id",
             "envelope.worktree/branch",
@@ -483,3 +661,57 @@ class TestGaps:
     )
     def test_named_gaps_present(self, metric):
         assert any(g["metric"] == metric for g in metrics.GAPS), metric
+
+    def test_failed_attempt_gap_covers_tokens_and_cost(self):
+        gap = next(g for g in metrics.GAPS if g["metric"] == "failed_attempt.tokens/cost")
+        assert "usage" in gap["needed_hook"] and "billed_cost_usd" in gap["needed_hook"]
+        assert "api_request_error" in gap["reason"]
+
+    def test_failover_and_key_attribution_gaps_cover_credential_rotation(self):
+        key_gap = next(g for g in metrics.GAPS if g["metric"] == "envelope.key_id")
+        assert "credential rotation" in key_gap["reason"]
+        fallback_gap = next(
+            g for g in metrics.GAPS if g["metric"] == "envelope.call_class = 'fallback'"
+        )
+        assert "credential" in fallback_gap["reason"]
+        assert "credential-rotation" in fallback_gap["needed_hook"]
+
+
+# ---------------------------------------------------------------------------
+# agent_loop_stopped interrupt observer (sourceable — mapped, not a gap)
+# ---------------------------------------------------------------------------
+
+
+class TestInterruptMetrics:
+    def test_gateway_fire_site_kwargs(self):
+        # gateway/run_agent_cache.py:492-498
+        out = metrics.interrupt_metrics_from_agent_loop_stopped(
+            {
+                "session_key": "telegram:chat:123",
+                "platform": "telegram",
+                "reason": "user_requested",
+                "invalidation_reason": "session_interrupt",
+            }
+        )
+        assert out == {
+            "session_key": "telegram:chat:123",
+            "platform": "telegram",
+            "interrupt_reason": "user_requested",
+            "invalidation_reason": "session_interrupt",
+        }
+
+    def test_tui_fire_site_kwargs(self):
+        # tui_gateway/session_lifecycle.py:614-617
+        out = metrics.interrupt_metrics_from_agent_loop_stopped(
+            {
+                "session_key": "20260919_101500_abc123",
+                "platform": "tui",
+                "reason": "user_stop",
+                "invalidation_reason": "session_interrupt",
+            }
+        )
+        assert out["interrupt_reason"] == "user_stop"
+
+    def test_missing_reasons_dropped_and_key_is_session_key(self):
+        out = metrics.interrupt_metrics_from_agent_loop_stopped({"session_key": "k"})
+        assert out == {"session_key": "k"}
