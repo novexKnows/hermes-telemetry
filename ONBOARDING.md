@@ -28,6 +28,7 @@
 17. [Valid Hooks Reference](#valid-hooks-reference)
 18. [Dashboard Plugin Surface](#dashboard-plugin-surface)
 19. [Hermes Session Storage (transcripts and artifacts)](#hermes-session-storage-transcripts-and-artifacts)
+20. [Correlation Envelope & Redaction (R-OBS-00, HTB-B1)](#correlation-envelope--redaction-r-obs-00-htb-b1)
 
 ---
 
@@ -2226,3 +2227,88 @@ promise and can change on any upgrade.
 - Keep the connection short-lived: a live Hermes is writing to the same WAL.
 - Cover schema drift in tests explicitly, the same way the migration tests cover
   upgrade paths.
+
+---
+
+## Correlation Envelope & Redaction (R-OBS-00, HTB-B1)
+
+> Added in the HTB-B1 stream. Read together with the pinned contract:
+> `schemas/correlation-envelope.schema.json` and `docs/telemetry/telemetry-contract.md`
+> (both byte-identical copies of the R-OBS-00 source, sha256-pinned in
+> `envelope.py` and enforced by `tests/test_envelope_schema_drift.py` at test
+> time — the pins are `SCHEMA_SHA256` / `CONTRACT_SHA256`, NOT file bytes).
+
+### Modules
+
+- `envelope.py` — builds envelope dicts conforming to the pinned schema and
+  emits metadata-only records from the plugin's EXISTING 12 hooks. In-memory
+  only (bounded 1000-record ring): durable transport is B3's (`transport.py`),
+  which must consume the ALREADY-REDACTED record, never raw hook kwargs.
+- `redaction.py` — allowlist-only sanitizer (`ALLOWED_EVENT_KEYS`) plus a
+  value-level secret-shape scrubber (`sk-…`, `ghp_…`, `AKIA…`, bearer tokens,
+  Sentry DSNs, private-key blocks, credentialed URLs). Applied inside
+  `envelope.emit()` BEFORE anything is buffered or handed off. Dropped keys are
+  counted, never logged, never echoed.
+
+### What is emitted per hook
+
+Every registered hook emits `{"envelope": <schema-conformant>, "event":
+<allowlisted metadata>}`. Envelope `call_class` derivation: `platform ==
+"cron"` → `cron`; hook family `subagent_*` → `delegate`; else `primary`
+(`fallback`/`aux`/`judge` reserved). `handoff_id` stays null (no handoff
+semantics in hooks yet). Turnstone extension fields are always null
+(harness-originated); `harness_task_id`/`harness_run_id` populate only from the
+`TURNSTONE_HARNESS_*` env PAIR (carried together per contract §1.5).
+
+Base-field derivation fallbacks (schema requires non-null non-empty): board ←
+`HERMES_KANBAN_BOARD` → `"hermes"`; task_id ← `HERMES_KANBAN_TASK` →
+`"unknown"`; run_id ← `HERMES_KANBAN_RUN_ID` → `"unknown"`; key_id ←
+`HERMES_TELEMETRY_KEY_ID` (a NON-SECRET label) → `"unlabeled"`; worktree/branch
+← `HERMES_KANBAN_BRANCH` → one-shot cached `git rev-parse` in cwd →
+`"no-git"`; trace_id ← `"trc-" + sha256(session_id)[:24]` (deterministic,
+stateless). Kill switch: `HERMES_TELEMETRY_ENVELOPE_ENABLED=0` disables
+emission without touching any enforcement gate.
+
+### Non-obvious decisions
+
+1. **The envelope is scrubbed too.** Envelope fields are built from hook
+   kwargs (model id, provider, profile), so the value-level scrubber runs over
+   the envelope as well — a secret-shaped string can never ride on `model` or
+   any other field. An invalid `call_class` is NOT silently coerced in
+   `build_envelope()`; it surfaces via `structural_errors()` and `emit()` emits
+   nothing (never emit a non-conforming envelope).
+2. **Metadata-only means content fields are never READ, not just never
+   serialized.** `user_message`, `conversation_history`, `args`, `result`,
+   `error_message` prose, `child_goal`, `child_summary`, `request{}` payloads —
+   the wiring never passes them to `emit()`; the allowlist is the second line
+   of defense, not the only one.
+3. **v0.21.3 kwarg shapes (A2 matrix, card t_c8fca739).** `api_request_error`
+   passes `error={"type","message"}` and `request={payload}` — the flat
+   `api_kwargs`/`error_type`/`error_message` kwargs are the pre-v0.21.3 shape;
+   the emitter reads `error["type"]` only, never `error["message"]` or
+   `request{}`. `post_tool_call` carries runtime-derived
+   `status`/`error_type`/`error_message`: status/error_type are emitted,
+   error_message never. `post_api_request` carries `moa_references` — the
+   envelope records only `moa_reference_count`; full per-advisor extraction
+   belongs to B2 (`metrics.py`).
+4. **G1 handoff gap (NOT fixed here, runtime-side):** every auxiliary
+   `call_llm`-based call (compression, title generation, MoA internals, vision,
+   TTS, …) fires NO plugin hooks, so no envelope exists for that spend. Per
+   R-SPIKE this is a MULTI-SEAM problem (≥3 interception points: turn_api_call
+   :130; sync auxiliary_client :6740; async :6976-7007, plus lazy async
+   consumers and further R-SPIKE-G2 bypasses) — routed to TM-C/PM. Do not
+   "solve" it by registering new hooks.
+5. **Test isolation hardening (incident 2026-09-19):** `HERMES_TELEMETRY_HOME`
+   outranks `HERMES_HOME` (paths.py:31) and an inherited ambient value once
+   routed synthetic rows into the real telemetry DB. The repo-wide conftest
+   contract stays "neutralize the ambient var per test" (asserted by
+   `tests/test_isolation.py::test_conftest_neutralizes_ambient_telemetry_home`);
+   the B1 emission tests additionally PIN both `HERMES_HOME` and
+   `HERMES_TELEMETRY_HOME` to the same disposable tmp home (TM directive).
+   Never `delenv` `HERMES_TELEMETRY_HOME` inside a narrower fixture that also
+   triggers persistence — re-pin it instead.
+6. **Budget stays off the emission path.** `envelope.emit()` is fail-open,
+   swallowed-exception, and its return value is never used by hook logic —
+   observability is evidence, never enforcement; the budget verdict path is
+   untouched (Trevor ruling: budget features stay optional and default-OFF in
+   integration configuration, and pre-provider admission stays out of scope).

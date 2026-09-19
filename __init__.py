@@ -164,7 +164,11 @@ def register(ctx) -> None:  # noqa: ANN001
     _setup_log_file()
     tele_log = logging.getLogger("hermes_telemetry")
 
-    from . import budget, core_pricing, db, moa, pricing, setup, stats
+    from . import budget, core_pricing, db, envelope, moa, pricing, setup, stats
+
+    # Correlation-envelope emitter context (HTB-B1): the profile IS the role
+    # per the R-OBS-00 schema ("profile/role"). Read once per plugin load.
+    _profile = str(getattr(ctx, "profile_name", None) or "")
 
     # ------------------------------------------------------------------
     # Start budget file watcher (hot-reload on budget.yaml changes)
@@ -212,6 +216,19 @@ def register(ctx) -> None:  # noqa: ANN001
                 platform,
                 cron_job_id,
             )
+            # R-OBS-00 correlation envelope (metadata only; fail-open).
+            envelope.emit(
+                hook="on_session_start",
+                session_id=session_id,
+                model=model,
+                platform=platform,
+                profile=_profile,
+                metadata={
+                    "platform": platform,
+                    "cron_job_id": cron_job_id or "",
+                    "model": model,
+                },
+            )
         except Exception as exc:
             tele_log.error("on_session_start failed: %s", exc)
 
@@ -232,6 +249,21 @@ def register(ctx) -> None:  # noqa: ANN001
     ) -> None:
         with _approx_lock:
             _approx_store[(session_id, api_call_count)] = approx_input_tokens
+        # R-OBS-00 correlation envelope (metadata only; fail-open).
+        envelope.emit(
+            hook="pre_api_request",
+            session_id=session_id,
+            model=str(_kw.get("model") or ""),
+            provider=str(_kw.get("provider") or ""),
+            platform=str(_kw.get("platform") or ""),
+            profile=_profile,
+            metadata={
+                "api_call_count": api_call_count,
+                "approx_input_tokens": approx_input_tokens,
+                "model": str(_kw.get("model") or ""),
+                "provider": str(_kw.get("provider") or ""),
+            },
+        )
 
     ctx.register_hook("pre_api_request", pre_api_request)
 
@@ -427,6 +459,40 @@ def register(ctx) -> None:  # noqa: ANN001
                             )
                     except Exception as _snap_exc:
                         tele_log.debug("pricing snapshot capture failed: %s", _snap_exc)
+
+            # R-OBS-00 correlation envelope (metadata only; fail-open).
+            envelope.emit(
+                hook="post_api_request",
+                session_id=session_id,
+                model=effective_model,
+                provider=provider,
+                platform=str(_kw.get("platform") or ""),
+                profile=_profile,
+                metadata={
+                    "model": effective_model,
+                    "provider": provider,
+                    "api_call_count": api_call_count,
+                    "latency_ms": latency_ms,
+                    "finish_reason": str(_kw.get("finish_reason") or ""),
+                    "tokens_in": tokens_in,
+                    "tokens_out": tokens_out,
+                    "cache_read_tokens": cache_read_tok,
+                    "cache_write_tokens": cache_write_tok,
+                    "reasoning_tokens": reasoning_tok,
+                    "cost_usd": cost,
+                    "estimated": estimated,
+                    "provider_assumed": provider_assumed,
+                    "moa_preset": moa_preset or "",
+                    "assistant_content_chars": assistant_content_chars,
+                    # A2 gap G2: v0.21.3 delivers per-advisor MoA metrics on
+                    # the moa_references kwarg. The envelope only records the
+                    # COUNT (metadata) — the full metrics list is B2's
+                    # (metrics.py) to extract; emission must not swallow it.
+                    "moa_reference_count": len(_kw.get("moa_references") or [])
+                    if isinstance(_kw.get("moa_references"), (list, tuple))
+                    else 0,
+                },
+            )
         except Exception as exc:
             tele_log.error("post_api_request hook failed: %s", exc)
 
@@ -459,6 +525,34 @@ def register(ctx) -> None:  # noqa: ANN001
         **_kw,
     ) -> None:
         try:
+            # R-OBS-00 correlation envelope: emitted for EVERY api error
+            # (not just 404) — status/error-class metadata only.
+            #
+            # v0.21.3 kwarg shape (agent/api_request_hooks.py:175-215): the
+            # error class arrives NESTED as error={"type","message"} and the
+            # wire payload as request={...}. error["message"] and the entire
+            # request{} dict are content-bearing (never-export per
+            # telemetry-contract §3.2) and are NEVER read here. The flat
+            # error_type/error_message kwargs are the pre-v0.21.3 shape —
+            # error_message from that legacy path is likewise never emitted.
+            _error_block = _kw.get("error") if isinstance(_kw.get("error"), dict) else {}
+            _error_type = str(_error_block.get("type") or error_type or "")
+            envelope.emit(
+                hook="api_request_error",
+                session_id=session_id,
+                model=model,
+                provider=provider,
+                platform=str(_kw.get("platform") or ""),
+                profile=_profile,
+                metadata={
+                    "status_code": status_code if status_code is not None else 0,
+                    "error_type": _error_type,
+                    "retryable": bool(retryable),
+                    "retry_count": int(_kw.get("retry_count") or 0),
+                    "model": model,
+                    "provider": provider,
+                },
+            )
             if status_code != 404:
                 return
             # Conservative filter: 404 must be non-retryable to count as a true
@@ -546,6 +640,27 @@ def register(ctx) -> None:  # noqa: ANN001
                 ok=ok,
                 latency_ms=duration_ms,
             )
+            # R-OBS-00 correlation envelope: tool NAME + outcome metadata only.
+            # The tool `result` and `args` payloads are never emitted
+            # (telemetry-contract §3.2 — tool-result bodies are never-export).
+            # v0.21.3 (model_tools.py:675-701) also derives status/error_type/
+            # error_message at runtime: status and error_type are metadata and
+            # are emitted; error_message is content-bearing prose and is NEVER
+            # emitted (A2 gap G6 redaction requirement).
+            envelope.emit(
+                hook="post_tool_call",
+                session_id=session_id,
+                profile=_profile,
+                metadata={
+                    "tool_name": tool_name,
+                    "ok": ok,
+                    "latency_ms": duration_ms,
+                    "tool_call_id": str(_kw.get("tool_call_id") or ""),
+                    "task_id": str(_kw.get("task_id") or ""),
+                    "status": str(_kw.get("status") or ""),
+                    "error_type": str(_kw.get("error_type") or ""),
+                },
+            )
         except Exception as exc:
             tele_log.error("post_tool_call hook failed: %s", exc)
 
@@ -570,6 +685,21 @@ def register(ctx) -> None:  # noqa: ANN001
         **_kw,
     ) -> None:
         try:
+            # R-OBS-00 correlation envelope: delegation edge metadata only.
+            # `child_goal` (free-text goal) is never emitted.
+            envelope.emit(
+                hook="subagent_start",
+                session_id=parent_session_id,
+                profile=_profile,
+                metadata={
+                    "parent_session_id": parent_session_id,
+                    "child_session_id": child_session_id,
+                    "parent_turn_id": parent_turn_id,
+                    "parent_subagent_id": parent_subagent_id,
+                    "child_subagent_id": child_subagent_id,
+                    "child_role": child_role,
+                },
+            )
             if not child_session_id or not parent_session_id:
                 return
             db.record_subagent_start(
@@ -621,6 +751,21 @@ def register(ctx) -> None:  # noqa: ANN001
                     child_role=child_role or None,
                     stopped_at=_utcnow(),
                 )
+            # R-OBS-00 correlation envelope: status/latency metadata only.
+            # `child_summary` (free-text result) is never emitted.
+            envelope.emit(
+                hook="subagent_stop",
+                session_id=parent_session_id,
+                profile=_profile,
+                metadata={
+                    "parent_session_id": parent_session_id,
+                    "child_session_id": child_session_id,
+                    "child_role": child_role,
+                    "child_status": child_status,
+                    "duration_ms": duration_ms,
+                    "ok": ok,
+                },
+            )
         except Exception as exc:
             tele_log.error("subagent_stop hook failed: %s", exc)
 
@@ -635,6 +780,15 @@ def register(ctx) -> None:  # noqa: ANN001
     def post_llm_call(session_id: str = "", **_kw) -> None:
         try:
             db.end_run(session_id=session_id, status="running")
+            # R-OBS-00 correlation envelope (metadata only; fail-open).
+            envelope.emit(
+                hook="post_llm_call",
+                session_id=session_id,
+                model=str(_kw.get("model") or ""),
+                platform=str(_kw.get("platform") or ""),
+                profile=_profile,
+                metadata={"model": str(_kw.get("model") or "")},
+            )
         except Exception as exc:
             tele_log.error("post_llm_call hook failed: %s", exc)
 
@@ -660,6 +814,15 @@ def register(ctx) -> None:  # noqa: ANN001
                 status = "error"
             db.end_run(session_id=session_id, status=status)
             tele_log.debug("session_end session=%s status=%s", session_id, status)
+            # R-OBS-00 correlation envelope (metadata only; fail-open).
+            envelope.emit(
+                hook="on_session_end",
+                session_id=session_id,
+                model=str(_kw.get("model") or ""),
+                platform=str(_kw.get("platform") or ""),
+                profile=_profile,
+                metadata={"status": status},
+            )
         except Exception as exc:
             tele_log.error("on_session_end hook failed: %s", exc)
 
@@ -676,6 +839,14 @@ def register(ctx) -> None:  # noqa: ANN001
         try:
             db.end_run(session_id=session_id, status="ok")
             tele_log.debug("session_finalize session=%s", session_id)
+            # R-OBS-00 correlation envelope (metadata only; fail-open).
+            envelope.emit(
+                hook="on_session_finalize",
+                session_id=session_id,
+                platform=str(_kw.get("platform") or ""),
+                profile=_profile,
+                metadata={"status": "ok"},
+            )
         except Exception as exc:
             tele_log.error("on_session_finalize hook failed: %s", exc)
 
@@ -692,6 +863,21 @@ def register(ctx) -> None:  # noqa: ANN001
     # ------------------------------------------------------------------
     def pre_llm_call(session_id: str = "", sender_id: str = "", **_kw):
         try:
+            # R-OBS-00 correlation envelope (metadata only; fail-open). Emitted
+            # before the budget logic — user_message/conversation_history are
+            # never emitted (telemetry-contract §3.2).
+            envelope.emit(
+                hook="pre_llm_call",
+                session_id=session_id,
+                model=str(_kw.get("model") or ""),
+                platform=str(_kw.get("platform") or ""),
+                profile=_profile,
+                metadata={
+                    "sender_id": sender_id,
+                    "is_first_turn": bool(_kw.get("is_first_turn")),
+                    "model": str(_kw.get("model") or ""),
+                },
+            )
             if sender_id:
                 db.set_sender(session_id, sender_id)
             db.set_profile(session_id, getattr(ctx, "profile_name", None))
@@ -760,6 +946,18 @@ def register(ctx) -> None:  # noqa: ANN001
     # ------------------------------------------------------------------
     def pre_tool_call(session_id: str = "", **_kw):
         try:
+            # R-OBS-00 correlation envelope (metadata only; fail-open). Tool
+            # `args` are never emitted (telemetry-contract §3.2).
+            envelope.emit(
+                hook="pre_tool_call",
+                session_id=session_id,
+                profile=_profile,
+                metadata={
+                    "tool_name": str(_kw.get("tool_name") or ""),
+                    "tool_call_id": str(_kw.get("tool_call_id") or ""),
+                    "task_id": str(_kw.get("task_id") or ""),
+                },
+            )
             run = db.get_run(session_id)
             if not run:
                 return None
