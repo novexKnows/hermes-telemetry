@@ -10,7 +10,8 @@ Only get_db_path() creates it, because the DB writes there. The budget/pricing
 path getters stay pure so an unwritable canonical home never turns a read into
 a crash — absence of budget.yaml is the "budgets disabled" signal, not an error.
 
-Governs telemetry files ONLY (telemetry.db, budget.yaml, pricing.yaml).
+Governs telemetry files ONLY (telemetry.db, budget.yaml, pricing.yaml) plus the
+durable event transport store (transport/, see transport.py).
 state.db and cron/ belong to the Hermes core home and are NOT relocated here.
 
 The dashboard surfaces (dashboard/plugin_api.py, dashboard/serve.py) do NOT
@@ -46,3 +47,13 @@ def get_budget_path() -> Path:
 
 def get_pricing_path() -> Path:
     return get_telemetry_home() / "pricing.yaml"
+
+
+def get_transport_dir() -> Path:
+    """Durable event-transport store (events.jsonl journal, state.json,
+    outage_ledger.jsonl). Ensures the directory exists — the transport writes
+    here on every enqueue (fail-closed: the journal is the durability floor)."""
+    home = get_telemetry_home()
+    d = home / "transport"
+    d.mkdir(parents=True, exist_ok=True)
+    return d

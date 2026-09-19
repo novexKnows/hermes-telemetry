@@ -48,3 +48,10 @@ def test_db_budget_pricing_share_one_dir(tmp_path, monkeypatch):
     assert paths.get_db_path() == tele / "telemetry.db"
     assert paths.get_budget_path() == tele / "budget.yaml"
     assert paths.get_pricing_path() == tele / "pricing.yaml"
+
+
+def test_get_transport_dir_creates_and_honors_precedence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_TELEMETRY_HOME", str(tmp_path / "shared"))
+    transport_dir = paths.get_transport_dir()
+    assert transport_dir == tmp_path / "shared" / "telemetry" / "transport"
+    assert transport_dir.is_dir()

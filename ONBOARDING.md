@@ -80,6 +80,11 @@ hermes-telemetry/
 │                          runs/tool_calls that flag session anti-patterns
 │                          (context rotation, loop traps, tool thrashing, high
 │                          error rate, massive sessions). See `§ Agent Intelligence`.
+├── transport.py         ← Durable event transport (HTB-B3): append-only JSONL
+│                          journal + fsync, cursor state, bounded retry/backoff
+│                          delivery, outage ledger, /telemetry-status. See
+│                          `§ Durable Event Transport` and
+│                          docs/telemetry/transport-failclosed.md.
 ├── moa.py               ← Mixture-of-Agents awareness. Resolves the `provider=
 │                          "moa"` virtual-provider preset to its aggregator's
 │                          real provider/model so the call is priced/attributed
@@ -1370,6 +1375,58 @@ The regex captures everything between the leading `cron_` and the trailing
 On mismatch, a WARNING is logged and `cron_job_id` is set to NULL — surfaced
 loudly rather than silently wrong. The comment `# If this test breaks...` is an
 intentional canary.
+
+---
+
+## Durable Event Transport (transport.py)
+
+`transport.py` is a durable, fail-closed local queue for R-OBS-00 correlation
+envelopes (HTB-B3). Full outage/staleness matrix with per-row test names:
+`docs/telemetry/transport-failclosed.md`.
+
+### Non-obvious design decisions
+
+1. **Journal before sink, fsync before return.** `enqueue(envelope)` appends
+   one JSONL line to `<telemetry home>/transport/events.jsonl` (via
+   `paths.get_transport_dir()`) and fsyncs BEFORE any sink attempt. The
+   receipt `{event_id, journal_offset}` is durable on return. The transport
+   receives ALREADY-REDACTED envelopes (B1 owns redaction); `enqueue` warns on
+   missing base fields but never drops — fail-closed means journal first.
+2. **Cursor, not per-event flags.** `state.json` holds `cursor_offset` (byte
+   offset through which every record is accepted at the sink),
+   `delivered_count`, `last_success_at`, `journal_size` (used by the torn-line
+   repair to validate only the untrusted tail), and the open outage episode.
+   Crash resume = seek to cursor. Delivered events are counted, never listed.
+3. **At-least-once + sink-side dedupe.** A crash between sink-accept and
+   cursor-persist redelivers the batch. Records carry a stable `event_id`;
+   sinks MUST dedupe on it (`LocalFileSink` is the conformance reference).
+   The transport never assumes exactly-once by itself.
+4. **Partial accept stops the flush.** `sink.deliver()` returns
+   `{ok, accepted, detail}`; `accepted` counts events durable IN ORDER. A
+   partial accept advances the cursor over the accepted prefix only, then ends
+   the flush with the remainder pending — the next flush redelivers exactly
+   the unaccepted tail (never the accepted prefix).
+5. **The sink owns its timeout.** The transport treats any exception or
+   non-conforming result as a failed attempt and retries with exponential
+   backoff (base·2ⁿ, capped, retry budget reset on success). It does NOT wrap
+   `deliver()` in a thread timeout — B4 exporters own their HTTP timeouts.
+6. **Torn final line, never silent.** On init the journal tail beyond
+   `journal_size` is validated; a torn partial line is truncated at the last
+   complete record with a logged warning and a persisted `torn_truncations`
+   counter. Earlier complete records are never touched (append-only writes
+   mean only the LAST line can be torn).
+7. **No-sink default is fail-closed.** With no sink configured, events
+   accumulate as pending (visible staleness) — never dropped, never fatal.
+
+### /telemetry-status
+
+Registered in `register()` via `ctx.register_command` (verified signature in
+the live source: `register_command(name, handler(raw_args: str) -> str,
+description=..., args_hint=...)` — same pattern as /stats). Human output by
+default; `/telemetry-status json` returns the machine-readable record with the
+pinned keys `journaled`, `delivered`, `pending`, `oldest_pending_age_seconds`,
+`last_success_at` (+ `cursor_offset`, `torn_truncations`, `outage_open`,
+`sink_configured`, `transport_dir`).
 
 ---
 
